@@ -1,0 +1,29 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Node
+server/node_modules/
+
+# Server build artifacts
+server/bin/
+server/obj/
+server/*.dll
+server/*.exe
+server/*.pdb
+server/*.deps.json
+server/*.runtimeconfig.json
+server/*.bin
+server/*.err
