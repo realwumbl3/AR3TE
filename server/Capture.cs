@@ -530,6 +530,7 @@ public class Capture {
         private int pointerY;
         private bool canMapDesktopSurface;
         private bool emittedInitialFrame;
+        private int gdiBootstrapFramesRemaining;
 
         public override void Initialize(int monitorIndex) {
             DisposeDxgi();
@@ -590,6 +591,7 @@ public class Capture {
             int width = (int)desc.ModeDescription.Width;
             int height = (int)desc.ModeDescription.Height;
             canMapDesktopSurface = desc.DesktopImageInSystemMemory;
+            emittedInitialFrame = false;
 
             var outputDesc = output.Description;
             monitorOriginX = outputDesc.DesktopCoordinates.Left;
@@ -598,6 +600,7 @@ public class Capture {
             Console.Error.WriteLine($"DXGI Initialized: Output={output.Description.DeviceName} Origin={monitorOriginX},{monitorOriginY} Size={width}x{height}");
             Console.Error.Flush();
 
+            gdiBootstrapFramesRemaining = 8;
             EnsureBitmaps(width, height);
             CreateStagingTexture(width, height);
             BootstrapPointerShape();
@@ -678,6 +681,18 @@ public class Capture {
             }
         }
 
+        private void CaptureScreenSnapshot(Bitmap target) {
+            using (Graphics g = Graphics.FromImage(target)) {
+                g.CopyFromScreen(
+                    monitorOriginX,
+                    monitorOriginY,
+                    0,
+                    0,
+                    captureSize,
+                    CopyPixelOperation.SourceCopy);
+            }
+        }
+
         private void RefreshPointerPosition() {
             POINT cursorPos;
             if (!GetCursorPos(out cursorPos)) {
@@ -744,6 +759,14 @@ public class Capture {
         protected override bool CaptureFrameIntoBitmap() {
             if (duplication == null) throw new InvalidOperationException("DXGI not initialized");
 
+            if (gdiBootstrapFramesRemaining > 0) {
+                CaptureScreenSnapshot(desktopBitmap);
+                UpdatePointerMetadataFromCursor();
+                gdiBootstrapFramesRemaining--;
+                emittedInitialFrame = true;
+                return true;
+            }
+
             IDXGIResource desktopResource = null;
             bool acquired = false;
             try {
@@ -751,6 +774,7 @@ public class Capture {
                 if (result.Failure) {
                     if (result.Code == DXGI_ERROR_WAIT_TIMEOUT) {
                         if (!emittedInitialFrame) {
+                            CaptureScreenSnapshot(desktopBitmap);
                             emittedInitialFrame = true;
                             return true;
                         }
@@ -775,6 +799,15 @@ public class Capture {
                 }
                 if (desktopResource != null) desktopResource.Dispose();
             }
+        }
+
+        private void UpdatePointerMetadataFromCursor() {
+            POINT cursorPos;
+            if (!GetCursorPos(out cursorPos)) {
+                return;
+            }
+            pointerX = cursorPos.X - monitorOriginX;
+            pointerY = cursorPos.Y - monitorOriginY;
         }
 
         private void CopyMappedToBitmap(IntPtr source, int srcStride, Bitmap target, int width, int height) {
