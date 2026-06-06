@@ -251,7 +251,7 @@ fun ScreenSharingScreen(
                 Text(text = "Bitrate: $currentKbps kbps", color = if (currentKbps > 5000) Color.Yellow else Color.Unspecified, style = MaterialTheme.typography.bodySmall)
                 Text(text = "Target: 60Hz (DXGI capture)", style = MaterialTheme.typography.bodySmall)
                 Text(text = "Connection: WebSocket (Binary)", style = MaterialTheme.typography.bodySmall)
-                Text(text = "Encoder: JPEG 1080p max (Q45)", style = MaterialTheme.typography.bodySmall)
+                Text(text = "Encoder: H.264 GPU low-latency", style = MaterialTheme.typography.bodySmall)
             }
         }
 

@@ -161,112 +161,154 @@ socket.on("listening", () => {
 
 socket.bind(PORT);
 
-// --- High Performance Capture Process ---
-const captureDllCandidates = [
-  path.join(__dirname, "bin", "Release", "net8.0-windows", "Capture.dll"),
-  path.join(__dirname, "Capture.dll"),
-  path.join("C:\\tmp", "capture-build", "Capture.dll"),
-];
-const captureDll = captureDllCandidates.find((candidate) => fs.existsSync(candidate));
-const captureExeCandidates = [
-  path.join(__dirname, "bin", "Release", "net8.0-windows", "Capture.exe"),
-  path.join(__dirname, "Capture.exe"),
-];
-const captureExe = captureExeCandidates.find((candidate) => fs.existsSync(candidate));
-const captureCommand = captureDll ? "dotnet" : captureExe;
-const captureArgs = captureDll ? [captureDll] : [];
-const MAX_FRAME_BYTES = 20 * 1024 * 1024;
+// --- GPU H.264 Capture Process ---
+const ffmpegCandidates = [
+  process.env.FFMPEG_PATH,
+  "ffmpeg",
+  path.join(
+    process.env.LOCALAPPDATA || "",
+    "Microsoft",
+    "WinGet",
+    "Packages",
+    "Gyan.FFmpeg.Essentials_Microsoft.Winget.Source_8weky3d8bbwe",
+    "ffmpeg-7.1-essentials_build",
+    "bin",
+    "ffmpeg.exe"
+  ),
+].filter(Boolean);
 
-function describeCaptureArtifact() {
-  const artifactPath = captureDll || captureExe;
-  if (!artifactPath) {
-    return null;
-  }
-
-  const kind = captureDll ? "DLL" : "EXE";
-  let builtAt = "unknown";
-  try {
-    builtAt = fs.statSync(artifactPath).mtime.toISOString();
-  } catch {
-    // Ignore stat failures and keep the path in the log.
-  }
-
-  return { artifactPath, kind, builtAt };
-}
-
+const captureEncoders = ["h264_nvenc"];
 let captureProcess = null;
+let rawCaptureProcess = null;
 let shuttingDown = false;
-let lastFrame = null;
-let buffer = Buffer.alloc(0);
-let stderrBuffer = "";
+let activeMonitorIndex = 0;
+let activeMonitorInfo = null;
+let activeVideoInfo = null;
+let ffmpegPath = null;
+let nalBuffer = Buffer.alloc(0);
+let currentAccessUnit = [];
+let currentAccessUnitHasIdr = false;
+let lastSps = null;
+let lastPps = null;
+let lastKeyframe = null;
+let lastVideoConfig = null;
+let sentVideoConfig = false;
+let loggedFirstFrame = false;
+let restartRequested = false;
+let rawCaptureStderrBuffer = "";
+let lastCursorMessage = null;
 
-function startCaptureProcess() {
-  if (shuttingDown) {
-    return;
-  }
-  if (!captureCommand) {
-    throw new Error("No capture runtime found");
-  }
-  const captureArtifact = describeCaptureArtifact();
-  if (captureArtifact) {
-    console.log(
-      `Starting capture from ${captureArtifact.kind}: ${captureArtifact.artifactPath} (mtime ${captureArtifact.builtAt})`
-    );
-  }
-  captureProcess = spawn(captureCommand, captureArgs, { stdio: ["pipe", "pipe", "pipe"] });
-
-  captureProcess.stdout.on("data", (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-
-    while (buffer.length >= 4) {
-      const length = buffer.readInt32LE(0);
-      if (length <= 0 || length > MAX_FRAME_BYTES) {
-        console.error(`Invalid frame length (${length}), resetting stream parser`);
-        buffer = Buffer.alloc(0);
-        break;
-      }
-      if (buffer.length >= 4 + length) {
-        lastFrame = buffer.slice(4, 4 + length);
-        broadcastFrame(lastFrame);
-        buffer = buffer.slice(4 + length);
-      } else {
-        break;
-      }
+function findExecutable(candidates) {
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (fs.existsSync(candidate)) {
+      return candidate;
     }
-  });
+  }
 
-  captureProcess.stderr.on("data", (chunk) => {
-    stderrBuffer += chunk.toString("utf8");
-    let newlineIndex;
-    while ((newlineIndex = stderrBuffer.indexOf("\n")) !== -1) {
-      const line = stderrBuffer.slice(0, newlineIndex).replace(/\r$/, "");
-      stderrBuffer = stderrBuffer.slice(newlineIndex + 1);
-      if (line.startsWith("CURSOR ")) {
-        const payload = line.slice(7);
-        try {
-          const cursor = JSON.parse(payload);
-          broadcastText(JSON.stringify({ type: "cursor", ...cursor }));
-        } catch {
-          process.stderr.write(`[Capture] ${line}\n`);
-        }
-      } else if (line.length > 0) {
-        process.stderr.write(`[Capture] ${line}\n`);
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      const found = execSync(`where ${candidate}`, {
+        encoding: "utf8",
+        windowsHide: true,
+      })
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find(Boolean);
+      if (found && fs.existsSync(found)) {
+        return found;
       }
+    } catch {
+      // Try the next candidate.
     }
-  });
+  }
 
-  captureProcess.on("exit", (code, signal) => {
-    if (shuttingDown) {
-      return;
-    }
-    console.error(`Capture process exited (code=${code}, signal=${signal}), restarting...`);
-    setTimeout(startCaptureProcess, 1000);
-  });
+  return null;
 }
 
-startCaptureProcess();
+function getMonitorInfo(index) {
+  const script = [
+    "$ProgressPreference = 'SilentlyContinue'",
+    "Add-Type -AssemblyName System.Windows.Forms",
+    "$screens = [System.Windows.Forms.Screen]::AllScreens",
+    "$rows = @()",
+    "for ($i = 0; $i -lt $screens.Length; $i++) {",
+    "  $screen = $screens[$i]",
+    "  $b = $screen.Bounds",
+    "  $rows += [pscustomobject]@{ DeviceName = $screen.DeviceName; Primary = $screen.Primary; X = $b.X; Y = $b.Y; Width = $b.Width; Height = $b.Height }",
+    "}",
+    "$rows | ConvertTo-Json -Compress",
+  ].join("; ");
 
-function broadcastFrame(frame) {
+  const encodedScript = Buffer.from(script, "utf16le").toString("base64");
+  const output = execSync(`powershell.exe -NoProfile -EncodedCommand ${encodedScript}`, {
+    encoding: "utf8",
+    windowsHide: true,
+  }).trim();
+
+  const monitorRows = JSON.parse(output);
+  const monitors = (Array.isArray(monitorRows) ? monitorRows : [monitorRows])
+    .map((row) => {
+      return {
+        deviceName: row.DeviceName,
+        primary: Boolean(row.Primary),
+        x: Number(row.X),
+        y: Number(row.Y),
+        width: Number(row.Width),
+        height: Number(row.Height),
+      };
+    })
+    .filter((monitor) => [monitor.x, monitor.y, monitor.width, monitor.height].every(Number.isFinite))
+    .sort((a, b) => {
+      if (a.primary !== b.primary) {
+        return a.primary ? -1 : 1;
+      }
+      if (a.x !== b.x) {
+        return a.x - b.x;
+      }
+      return a.y - b.y;
+    });
+
+  const monitor = monitors[index];
+  if (!monitor) {
+    throw new Error(`Invalid monitor index ${index + 1}. Available monitors: ${monitors.length}`);
+  }
+  return monitor;
+}
+
+function resetStreamState() {
+  nalBuffer = Buffer.alloc(0);
+  currentAccessUnit = [];
+  currentAccessUnitHasIdr = false;
+  lastSps = null;
+  lastPps = null;
+  lastKeyframe = null;
+  lastVideoConfig = null;
+  sentVideoConfig = false;
+  loggedFirstFrame = false;
+  lastCursorMessage = null;
+}
+
+function stopRawCaptureProcess() {
+  if (rawCaptureProcess && !rawCaptureProcess.killed) {
+    rawCaptureProcess.kill();
+  }
+  rawCaptureProcess = null;
+}
+
+function stopCaptureProcess() {
+  stopRawCaptureProcess();
+  if (captureProcess && !captureProcess.killed) {
+    captureProcess.kill();
+  }
+}
+
+function sendBinary(frame) {
+  if (!loggedFirstFrame) {
+    console.log(`First video payload sent (${frame.length} bytes)`);
+    loggedFirstFrame = true;
+  }
   wss.clients.forEach((client) => {
     if (client.readyState === 1) { // OPEN
       client.send(frame);
@@ -282,22 +324,399 @@ function broadcastText(message) {
   });
 }
 
+function sendVideoConfig() {
+  if (!lastVideoConfig || sentVideoConfig) {
+    return;
+  }
+  console.log(
+    `Sending video_config ${lastVideoConfig.width}x${lastVideoConfig.height} ` +
+      `fps=${lastVideoConfig.fps} encoder=${lastVideoConfig.encoder}`
+  );
+  broadcastText(JSON.stringify(lastVideoConfig));
+  sentVideoConfig = true;
+}
+
+function sendStreamReset() {
+  broadcastText(JSON.stringify({
+    type: "stream_reset",
+    monitor: activeMonitorIndex + 1,
+  }));
+}
+
+function handleRawCaptureStderr(chunk) {
+  rawCaptureStderrBuffer += chunk.toString("utf8");
+  const lines = rawCaptureStderrBuffer.split(/\r?\n/);
+  rawCaptureStderrBuffer = lines.pop() || "";
+
+  for (const line of lines) {
+    if (line.startsWith("CURSOR ")) {
+      lastCursorMessage = line.slice(7);
+      broadcastText(lastCursorMessage);
+    } else if (line.trim()) {
+      process.stderr.write(`[capture] ${line}\n`);
+    }
+  }
+}
+
+function buildAvcConfigRecord(sps, pps) {
+  if (!sps || !pps || sps.length < 4 || pps.length < 1) {
+    return null;
+  }
+
+  const config = Buffer.alloc(11 + sps.length + pps.length);
+  let offset = 0;
+  config[offset++] = 1;
+  config[offset++] = sps[1];
+  config[offset++] = sps[2];
+  config[offset++] = sps[3];
+  config[offset++] = 0xfc | 3;
+  config[offset++] = 0xe0 | 1;
+  config.writeUInt16BE(sps.length, offset);
+  offset += 2;
+  sps.copy(config, offset);
+  offset += sps.length;
+  config[offset++] = 1;
+  config.writeUInt16BE(pps.length, offset);
+  offset += 2;
+  pps.copy(config, offset);
+  offset += pps.length;
+  return config.slice(0, offset);
+}
+
+function flushAccessUnit(accessUnit, isKeyframe) {
+  if (!accessUnit.length) {
+    return;
+  }
+
+  const chunks = [];
+  if (isKeyframe && lastSps && lastPps) {
+    for (const nal of [lastSps, lastPps]) {
+      chunks.push(Buffer.from([0, 0, 0, 1]), Buffer.from(nal));
+    }
+  }
+
+  for (const nal of accessUnit) {
+    chunks.push(Buffer.from([0, 0, 0, 1]), Buffer.from(nal));
+  }
+
+  const frame = Buffer.concat(chunks);
+  if (isKeyframe) {
+    lastKeyframe = frame;
+  }
+  sendBinary(frame);
+}
+
+function handleNalUnit(nal) {
+  if (!nal || nal.length === 0) {
+    return;
+  }
+
+  const nalType = nal[0] & 0x1f;
+  if (nalType === 7) {
+    lastSps = Buffer.from(nal);
+    if (lastPps && activeMonitorInfo && !lastVideoConfig) {
+      const avcConfig = buildAvcConfigRecord(lastSps, lastPps);
+      lastVideoConfig = {
+        type: "video_config",
+        codec: "video/avc",
+        width: (activeVideoInfo || activeMonitorInfo).width,
+        height: (activeVideoInfo || activeMonitorInfo).height,
+        fps: 60,
+        encoder: currentEncoderName,
+        sps: lastSps.toString("base64"),
+        pps: lastPps.toString("base64"),
+        config: avcConfig ? avcConfig.toString("base64") : null,
+      };
+      sendVideoConfig();
+    }
+    return;
+  }
+
+  if (nalType === 8) {
+    lastPps = Buffer.from(nal);
+    if (lastSps && activeMonitorInfo && !lastVideoConfig) {
+      const avcConfig = buildAvcConfigRecord(lastSps, lastPps);
+      lastVideoConfig = {
+        type: "video_config",
+        codec: "video/avc",
+        width: (activeVideoInfo || activeMonitorInfo).width,
+        height: (activeVideoInfo || activeMonitorInfo).height,
+        fps: 60,
+        encoder: currentEncoderName,
+        sps: lastSps.toString("base64"),
+        pps: lastPps.toString("base64"),
+        config: avcConfig ? avcConfig.toString("base64") : null,
+      };
+      sendVideoConfig();
+    }
+    return;
+  }
+
+  if (nalType === 9) {
+    if (currentAccessUnit.length > 0) {
+      flushAccessUnit(currentAccessUnit, currentAccessUnitHasIdr);
+      currentAccessUnit = [];
+      currentAccessUnitHasIdr = false;
+    }
+    return;
+  }
+
+  if (nalType === 5) {
+    currentAccessUnitHasIdr = true;
+  }
+  currentAccessUnit.push(Buffer.from(nal));
+}
+
+function parseAnnexBStream(chunk) {
+  nalBuffer = Buffer.concat([nalBuffer, chunk]);
+
+  let start = -1;
+  let startLength = 0;
+
+  for (let i = 0; i + 3 < nalBuffer.length; i++) {
+    if (nalBuffer[i] !== 0 || nalBuffer[i + 1] !== 0) {
+      continue;
+    }
+    if (nalBuffer[i + 2] === 1) {
+      start = i;
+      startLength = 3;
+      break;
+    }
+    if (i + 3 < nalBuffer.length && nalBuffer[i + 2] === 0 && nalBuffer[i + 3] === 1) {
+      start = i;
+      startLength = 4;
+      break;
+    }
+  }
+
+  if (start < 0) {
+    if (nalBuffer.length > 4) {
+      nalBuffer = nalBuffer.slice(nalBuffer.length - 4);
+    }
+    return;
+  }
+
+  if (start > 0) {
+    nalBuffer = nalBuffer.slice(start);
+  }
+
+  while (true) {
+    let next = -1;
+    let nextLength = 0;
+    for (let i = startLength; i + 3 < nalBuffer.length; i++) {
+      if (nalBuffer[i] !== 0 || nalBuffer[i + 1] !== 0) {
+        continue;
+      }
+      if (nalBuffer[i + 2] === 1) {
+        next = i;
+        nextLength = 3;
+        break;
+      }
+      if (i + 3 < nalBuffer.length && nalBuffer[i + 2] === 0 && nalBuffer[i + 3] === 1) {
+        next = i;
+        nextLength = 4;
+        break;
+      }
+    }
+
+    if (next < 0) {
+      if (start > 0) {
+        nalBuffer = nalBuffer.slice(0);
+      }
+      break;
+    }
+
+    const nal = nalBuffer.slice(startLength, next);
+    handleNalUnit(nal);
+    nalBuffer = nalBuffer.slice(next);
+    startLength = nextLength;
+  }
+}
+
+function getStreamSize(monitorInfo) {
+  const maxWidth = 2560;
+  const maxHeight = 1440;
+  const scale = Math.min(maxWidth / monitorInfo.width, maxHeight / monitorInfo.height);
+  if (scale >= 1) {
+    return { width: monitorInfo.width, height: monitorInfo.height };
+  }
+  return {
+    width: Math.max(1, Math.round(monitorInfo.width * scale)),
+    height: Math.max(1, Math.round(monitorInfo.height * scale)),
+  };
+}
+
+function getCaptureDescription(monitorInfo, monitorIndex) {
+  return "raw Capture.exe pipe";
+}
+
+function buildRawFfmpegArgs(encoderName, videoInfo) {
+  const common = [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-f",
+    "rawvideo",
+    "-pix_fmt",
+    "bgra",
+    "-video_size",
+    `${videoInfo.width}x${videoInfo.height}`,
+    "-framerate",
+    "60",
+    "-i",
+    "pipe:0",
+    "-an",
+    "-vf",
+    "format=nv12",
+  ];
+
+  return common.concat([
+    "-c:v",
+    encoderName,
+    "-profile:v",
+    "baseline",
+    "-preset",
+    "p5",
+    "-tune",
+    "ll",
+    "-rc",
+    "vbr",
+    "-cq",
+    "19",
+    "-b:v",
+    "0",
+    "-g",
+    "30",
+    "-bf",
+    "0",
+    "-zerolatency",
+    "1",
+    "-aud",
+    "1",
+    "-bsf:v",
+    "dump_extra,h264_metadata=aud=insert",
+    "-f",
+    "h264",
+    "pipe:1",
+  ]);
+}
+
+let currentEncoderName = captureEncoders[0];
+
+function startCaptureProcess() {
+  if (shuttingDown) {
+    return;
+  }
+
+  if (!ffmpegPath) {
+    throw new Error("No ffmpeg runtime found");
+  }
+
+  if (!activeMonitorInfo) {
+    activeMonitorInfo = getMonitorInfo(activeMonitorIndex);
+  }
+  stopRawCaptureProcess();
+  activeVideoInfo = getStreamSize(activeMonitorInfo);
+
+  resetStreamState();
+  rawCaptureStderrBuffer = "";
+  const captureExe = path.join(__dirname, "Capture.exe");
+  const captureArgs = ["--raw", "--monitor", String(activeMonitorIndex + 1)];
+  const ffmpegArgs = buildRawFfmpegArgs(currentEncoderName, activeVideoInfo);
+  console.log(
+    `Starting raw capture + ${currentEncoderName} on monitor ${activeMonitorIndex + 1} ` +
+      `(${getCaptureDescription(activeMonitorInfo, activeMonitorIndex)}) ` +
+      `${activeMonitorInfo.deviceName || ""} ` +
+      `(${activeMonitorInfo.width}x${activeMonitorInfo.height} -> ${activeVideoInfo.width}x${activeVideoInfo.height})`
+  );
+  rawCaptureProcess = spawn(captureExe, captureArgs, { stdio: ["ignore", "pipe", "pipe"] });
+  captureProcess = spawn(ffmpegPath, ffmpegArgs, { stdio: ["pipe", "pipe", "pipe"] });
+  rawCaptureProcess.stdout.pipe(captureProcess.stdin);
+  rawCaptureProcess.stderr.on("data", (chunk) => {
+    handleRawCaptureStderr(chunk);
+  });
+  rawCaptureProcess.on("exit", (code, signal) => {
+    if (shuttingDown || restartRequested) {
+      return;
+    }
+    console.error(`raw capture exited (code=${code}, signal=${signal})`);
+    if (captureProcess && !captureProcess.killed) {
+      captureProcess.kill();
+    }
+  });
+
+  captureProcess.stdout.on("data", (chunk) => {
+    parseAnnexBStream(chunk);
+  });
+
+  captureProcess.stderr.on("data", (chunk) => {
+    process.stderr.write(`[ffmpeg] ${chunk.toString("utf8")}`);
+  });
+
+  captureProcess.on("exit", (code, signal) => {
+    if (shuttingDown) {
+      return;
+    }
+
+    console.error(`h264 capture exited (code=${code}, signal=${signal})`);
+    stopRawCaptureProcess();
+    if (restartRequested) {
+      restartRequested = false;
+      setTimeout(startCaptureProcess, 300);
+      return;
+    }
+    const encoderIndex = captureEncoders.indexOf(currentEncoderName);
+    if (code !== 0 && encoderIndex >= 0 && encoderIndex + 1 < captureEncoders.length) {
+      currentEncoderName = captureEncoders[encoderIndex + 1];
+      setTimeout(startCaptureProcess, 500);
+      return;
+    }
+
+    setTimeout(startCaptureProcess, 1000);
+  });
+}
+
+ffmpegPath = findExecutable(ffmpegCandidates);
+if (!ffmpegPath) {
+  throw new Error("No ffmpeg runtime found");
+}
+
+startCaptureProcess();
+
 // --- WebSocket Server ---
 const server = http.createServer();
 const wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws) => {
   console.log("Client connected");
-  if (lastFrame) {
-    ws.send(lastFrame);
+  if (lastVideoConfig) {
+    ws.send(JSON.stringify(lastVideoConfig));
+  }
+  if (lastKeyframe) {
+    ws.send(lastKeyframe);
+  }
+  if (lastCursorMessage) {
+    ws.send(lastCursorMessage);
   }
 
   ws.on("message", (message) => {
     try {
       const data = JSON.parse(message.toString());
       if (data.type === "set_monitor") {
-        if (captureProcess && !captureProcess.killed) {
-          captureProcess.stdin.write(`MONITOR ${data.value}\n`);
+        const nextMonitor = Math.max(0, Number(data.value) - 1);
+        if (Number.isInteger(nextMonitor) && nextMonitor !== activeMonitorIndex) {
+          activeMonitorIndex = nextMonitor;
+          activeMonitorInfo = getMonitorInfo(activeMonitorIndex);
+          currentEncoderName = captureEncoders[0];
+          sendStreamReset();
+          restartRequested = true;
+          stopRawCaptureProcess();
+          if (captureProcess && !captureProcess.killed) {
+            captureProcess.kill();
+          } else {
+            restartRequested = false;
+            startCaptureProcess();
+          }
           console.log(`Switched to monitor ${data.value}`);
         }
       }
@@ -313,16 +732,12 @@ server.listen(WS_PORT);
 
 function shutdown() {
   shuttingDown = true;
-  if (captureProcess && !captureProcess.killed) {
-    captureProcess.kill();
-  }
+  stopCaptureProcess();
   process.exit(0);
 }
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 process.on("exit", () => {
-  if (captureProcess && !captureProcess.killed) {
-    captureProcess.kill();
-  }
+  stopCaptureProcess();
 });

@@ -17,12 +17,15 @@ public class Capture {
     private static volatile int monitorIndex = 0;
     private static volatile bool running = true;
     private static bool dpiAwarenessEnabled = false;
+    private static IntPtr lastCursorHandle = IntPtr.Zero;
+    private static string lastCursorBase64 = "";
+    private static int lastCursorHotX = 0;
+    private static int lastCursorHotY = 0;
 
     private const int TARGET_FPS = 60;
-    private const int FRAME_INTERVAL_MS = 1000 / TARGET_FPS;
-    private const int MAX_STREAM_WIDTH = 1920;
-    private const int MAX_STREAM_HEIGHT = 1080;
-    private const long JPEG_QUALITY = 45L;
+    private const int DXGI_FRAME_TIMEOUT_MS = 16;
+    private const int MAX_STREAM_WIDTH = 2560;
+    private const int MAX_STREAM_HEIGHT = 1440;
 
     [DllImport("user32.dll")]
     private static extern bool SetProcessDPIAware();
@@ -132,47 +135,43 @@ public class Capture {
             Math.Max(1, (int)Math.Round(captureHeight * scale)));
     }
 
-    private static ImageCodecInfo GetEncoderInfo(string mimeType) {
-        foreach (var encoder in ImageCodecInfo.GetImageEncoders()) {
-            if (encoder.MimeType == mimeType) return encoder;
-        }
-        return null;
+    private static Screen[] GetOrderedScreens() {
+        var screens = Screen.AllScreens;
+        Array.Sort(screens, (a, b) => {
+            if (a.Primary != b.Primary) {
+                return a.Primary ? -1 : 1;
+            }
+            int xCompare = a.Bounds.X.CompareTo(b.Bounds.X);
+            if (xCompare != 0) return xCompare;
+            return a.Bounds.Y.CompareTo(b.Bounds.Y);
+        });
+        return screens;
     }
 
-    public static void Main() {
+    public static void Main(string[] args) {
         EnableDpiAwareness();
 
-        Thread commandThread = new Thread(() => {
-            while (running) {
-                string line = Console.ReadLine();
-                if (line == null) break;
-                if (line.StartsWith("MONITOR ")) {
-                    int newIndex;
-                    if (int.TryParse(line.Substring(8), out newIndex)) {
-                        monitorIndex = newIndex - 1;
-                    }
+        for (int i = 0; i < args.Length; i++) {
+            if (args[i] == "--raw") {
+                continue;
+            } else if (args[i] == "--monitor" && i + 1 < args.Length) {
+                int newIndex;
+                if (int.TryParse(args[i + 1], out newIndex)) {
+                    monitorIndex = newIndex - 1;
                 }
+                i++;
             }
-        });
-        commandThread.IsBackground = true;
-        commandThread.Start();
+        }
 
-        var jpegCodec = GetEncoderInfo("image/jpeg");
-        var encoderParameters = new EncoderParameters(1);
-        encoderParameters.Param[0] = new EncoderParameter(Encoder.Quality, JPEG_QUALITY);
-        var lengthBytes = new byte[4];
-
-        using (var ms = new MemoryStream(512 * 1024))
         using (var stdout = Console.OpenStandardOutput()) {
             FrameCapturer capturer = null;
             try {
                 capturer = new DxgiCapturer();
-            } catch {
+            } catch (Exception ex) {
+                Console.Error.WriteLine($"DXGI capturer construction failed, using GDI fallback: {ex.Message}");
                 capturer = new GdiCapturer();
             }
 
-            var frameTimer = Stopwatch.StartNew();
-            long nextFrameMs = 0;
             int activeMonitor = -1;
 
             while (running) {
@@ -183,26 +182,18 @@ public class Capture {
                         try {
                             capturer = new DxgiCapturer();
                             capturer.Initialize(currentTarget);
-                        } catch {
+                        } catch (Exception ex) {
+                            Console.Error.WriteLine($"DXGI initialization failed for monitor {currentTarget + 1}, using GDI fallback: {ex.Message}");
+                            Console.Error.Flush();
                             capturer = new GdiCapturer();
                             capturer.Initialize(currentTarget);
                         }
                         activeMonitor = currentTarget;
                     }
 
-                    capturer.CaptureFrame(ms, jpegCodec, encoderParameters);
-                    if (ms.Length == 0) {
+                    if (!capturer.CaptureRawFrame(stdout)) {
                         continue;
                     }
-
-                    byte[] buffer = ms.ToArray();
-
-                    lengthBytes[0] = (byte)buffer.Length;
-                    lengthBytes[1] = (byte)(buffer.Length >> 8);
-                    lengthBytes[2] = (byte)(buffer.Length >> 16);
-                    lengthBytes[3] = (byte)(buffer.Length >> 24);
-                    stdout.Write(lengthBytes, 0, 4);
-                    stdout.Write(buffer, 0, buffer.Length);
                     stdout.Flush();
                 } catch (Exception ex) {
                     try {
@@ -215,24 +206,11 @@ public class Capture {
                         capturer = new GdiCapturer();
                     } catch { }
                 }
-
-                nextFrameMs += FRAME_INTERVAL_MS;
-                long sleepMs = nextFrameMs - frameTimer.ElapsedMilliseconds;
-                if (sleepMs > 0) {
-                    Thread.Sleep((int)sleepMs);
-                } else if (sleepMs < -FRAME_INTERVAL_MS * 2) {
-                    nextFrameMs = frameTimer.ElapsedMilliseconds;
-                }
             }
 
             capturer.Dispose();
         }
     }
-
-    private static IntPtr lastCursorHandle = IntPtr.Zero;
-    private static string lastCursorBase64 = "";
-    private static int lastHx = 0;
-    private static int lastHy = 0;
 
     private static void DrawCursorOnBitmap(Bitmap bitmap, int monitorX, int monitorY, int monitorWidth, int monitorHeight) {
         CURSORINFO cursorInfo = new CURSORINFO();
@@ -264,22 +242,21 @@ public class Capture {
             return;
         }
 
-        string currentBase64 = null;
         int hotX = 0, hotY = 0;
+        string cursorBase64 = null;
+        ICONINFO iconInfo;
+        if (GetIconInfo(cursorHandle, out iconInfo)) {
+            hotX = iconInfo.xHotspot;
+            hotY = iconInfo.yHotspot;
 
-        if (cursorHandle != lastCursorHandle || string.IsNullOrEmpty(lastCursorBase64)) {
-            ICONINFO iconInfo;
-            if (GetIconInfo(cursorHandle, out iconInfo)) {
-                hotX = iconInfo.xHotspot;
-                hotY = iconInfo.yHotspot;
-
-                Bitmap cursorBmp = null;
+            if (cursorHandle != lastCursorHandle || string.IsNullOrEmpty(lastCursorBase64)) {
+                Bitmap cursorBitmap = null;
                 try {
-                    cursorBmp = Bitmap.FromHicon(cursorHandle);
+                    cursorBitmap = Bitmap.FromHicon(cursorHandle);
                 } catch {
                     try {
-                        cursorBmp = new Bitmap(64, 64, PixelFormat.Format32bppArgb);
-                        using (Graphics g = Graphics.FromImage(cursorBmp)) {
+                        cursorBitmap = new Bitmap(64, 64, PixelFormat.Format32bppArgb);
+                        using (Graphics g = Graphics.FromImage(cursorBitmap)) {
                             g.Clear(Color.Transparent);
                             IntPtr hdc = g.GetHdc();
                             try {
@@ -289,79 +266,46 @@ public class Capture {
                             }
                         }
                     } catch {
-                        cursorBmp?.Dispose();
-                        cursorBmp = null;
+                        cursorBitmap?.Dispose();
+                        cursorBitmap = null;
                     }
                 }
 
-                if (cursorBmp != null) {
+                if (cursorBitmap != null) {
                     try {
                         using (MemoryStream ms = new MemoryStream()) {
-                            cursorBmp.Save(ms, ImageFormat.Png);
-                            currentBase64 = Convert.ToBase64String(ms.ToArray());
-                            lastCursorBase64 = currentBase64;
+                            cursorBitmap.Save(ms, ImageFormat.Png);
+                            cursorBase64 = Convert.ToBase64String(ms.ToArray());
                             lastCursorHandle = cursorHandle;
-                            lastHx = hotX;
-                            lastHy = hotY;
+                            lastCursorBase64 = cursorBase64;
+                            lastCursorHotX = hotX;
+                            lastCursorHotY = hotY;
                         }
                     } catch {
-                        currentBase64 = null;
+                        cursorBase64 = null;
                     } finally {
-                        cursorBmp.Dispose();
+                        cursorBitmap.Dispose();
                     }
                 }
-
-                if (iconInfo.hbmColor != IntPtr.Zero) DeleteObject(iconInfo.hbmColor);
-                if (iconInfo.hbmMask != IntPtr.Zero) DeleteObject(iconInfo.hbmMask);
+            } else {
+                hotX = lastCursorHotX;
+                hotY = lastCursorHotY;
             }
-        } else {
-            currentBase64 = lastCursorBase64;
-            hotX = lastHx;
-            hotY = lastHy;
+
+            if (iconInfo.hbmColor != IntPtr.Zero) DeleteObject(iconInfo.hbmColor);
+            if (iconInfo.hbmMask != IntPtr.Zero) DeleteObject(iconInfo.hbmMask);
         }
 
-        EmitCursorMetadata(true, localX, localY, bitmap.Width, bitmap.Height, currentBase64, hotX, hotY);
-        // We no longer draw anything on the bitmap here.
+        EmitCursorMetadata(true, localX, localY, bitmap.Width, bitmap.Height, cursorBase64, hotX, hotY);
     }
 
-    private static void EmitCursorMetadata(bool visible, int x, int y, int width, int height, string base64, int hx, int hy) {
+    private static void EmitCursorMetadata(bool visible, int x, int y, int width, int height, string base64, int hotX, int hotY) {
         try {
-            string imgPart = !string.IsNullOrEmpty(base64) ? $",\"img\":\"{base64}\",\"hx\":{hx},\"hy\":{hy}" : "";
-            string json = $"{{\"visible\":{(visible ? "true" : "false")},\"x\":{x},\"y\":{y},\"w\":{width},\"h\":{height}{imgPart}}}";
+            string imagePart = !string.IsNullOrEmpty(base64) ? $",\"img\":\"{base64}\"" : "";
+            string json = $"{{\"type\":\"cursor\",\"visible\":{(visible ? "true" : "false")},\"x\":{x},\"y\":{y},\"w\":{width},\"h\":{height},\"hx\":{hotX},\"hy\":{hotY}{imagePart}}}";
             Console.Error.WriteLine("CURSOR " + json);
             Console.Error.Flush();
         } catch { }
-    }
-
-    private static void DrawPointerMarker(Graphics g, int x, int y) {
-        // Larger, high-contrast marker
-        const int size = 64;
-        const int arm = 32;
-
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-
-        // Outer glow/shadow
-        using (var shadowBrush = new SolidBrush(Color.FromArgb(120, Color.Black))) {
-            g.FillEllipse(shadowBrush, x - size / 2 - 2, y - size / 2 - 2, size + 4, size + 4);
-        }
-
-        // Inner fill
-        using (var fillBrush = new SolidBrush(Color.FromArgb(160, Color.Red))) {
-            g.FillEllipse(fillBrush, x - size / 2, y - size / 2, size, size);
-        }
-
-        // Crosshair
-        using (var p = new Pen(Color.Black, 6)) {
-            g.DrawEllipse(p, x - size / 2, y - size / 2, size, size);
-            g.DrawLine(p, x - arm - 4, y, x + arm + 4, y);
-            g.DrawLine(p, x, y - arm - 4, x, y + arm + 4);
-        }
-
-        using (var p = new Pen(Color.Yellow, 3)) {
-            g.DrawEllipse(p, x - size / 2 + 1, y - size / 2 + 1, size - 2, size - 2);
-            g.DrawLine(p, x - arm, y, x + arm, y);
-            g.DrawLine(p, x, y - arm, x, y + arm);
-        }
     }
 
     private static unsafe void CopyBitmapRegion(Bitmap source, Bitmap dest) {
@@ -489,7 +433,15 @@ public class Capture {
         protected int monitorOriginY;
 
         public abstract void Initialize(int monitorIndex);
-        public abstract void CaptureFrame(MemoryStream ms, ImageCodecInfo jpegCodec, EncoderParameters encoderParams);
+        public bool CaptureRawFrame(Stream output) {
+            if (!CaptureFrameIntoBitmap()) {
+                return false;
+            }
+            WriteRawFrame(output);
+            return true;
+        }
+
+        protected abstract bool CaptureFrameIntoBitmap();
 
         protected void EnsureBitmaps(int captureWidth, int captureHeight) {
             var newCaptureSize = new DrawingSize(captureWidth, captureHeight);
@@ -505,7 +457,7 @@ public class Capture {
 
             if (streamBitmap == null || streamSize != newStreamSize) {
                 streamBitmap?.Dispose();
-                streamBitmap = new Bitmap(newStreamSize.Width, newStreamSize.Height, PixelFormat.Format24bppRgb);
+                streamBitmap = new Bitmap(newStreamSize.Width, newStreamSize.Height, PixelFormat.Format32bppArgb);
                 streamSize = newStreamSize;
             }
         }
@@ -523,14 +475,12 @@ public class Capture {
             CopyBitmapRegion(desktopBitmap, captureBitmap);
         }
 
-        protected void EncodeFrame(MemoryStream ms, ImageCodecInfo jpegCodec, EncoderParameters encoderParams) {
+        protected void WriteRawFrame(Stream output) {
             PrepareCompositeFrame();
             DrawPointerOverlay();
 
-            ms.SetLength(0);
-            if (streamSize.Width == captureSize.Width && streamSize.Height == captureSize.Height) {
-                captureBitmap.Save(ms, jpegCodec, encoderParams);
-            } else {
+            Bitmap source = captureBitmap;
+            if (streamSize.Width != captureSize.Width || streamSize.Height != captureSize.Height) {
                 using (Graphics g = Graphics.FromImage(streamBitmap)) {
                     g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Low;
                     g.CompositingMode = CompositingMode.SourceCopy;
@@ -538,7 +488,20 @@ public class Capture {
                     g.DrawImage(captureBitmap, 0, 0, streamSize.Width, streamSize.Height);
                     g.Flush();
                 }
-                streamBitmap.Save(ms, jpegCodec, encoderParams);
+                source = streamBitmap;
+            }
+
+            var rect = new Rectangle(0, 0, source.Width, source.Height);
+            var data = source.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            try {
+                int rowBytes = source.Width * 4;
+                byte[] row = new byte[rowBytes];
+                for (int y = 0; y < source.Height; y++) {
+                    Marshal.Copy(data.Scan0 + y * data.Stride, row, 0, rowBytes);
+                    output.Write(row, 0, rowBytes);
+                }
+            } finally {
+                source.UnlockBits(data);
             }
         }
 
@@ -565,11 +528,13 @@ public class Capture {
         private bool hasPointerShape;
         private int pointerX;
         private int pointerY;
+        private bool canMapDesktopSurface;
+        private bool emittedInitialFrame;
 
         public override void Initialize(int monitorIndex) {
             DisposeDxgi();
 
-            var screens = Screen.AllScreens;
+            var screens = GetOrderedScreens();
             if (monitorIndex < 0 || monitorIndex >= screens.Length) monitorIndex = 0;
             var target = screens[monitorIndex].Bounds;
 
@@ -624,6 +589,7 @@ public class Capture {
             var desc = duplication.Description;
             int width = (int)desc.ModeDescription.Width;
             int height = (int)desc.ModeDescription.Height;
+            canMapDesktopSurface = desc.DesktopImageInSystemMemory;
 
             var outputDesc = output.Description;
             monitorOriginX = outputDesc.DesktopCoordinates.Left;
@@ -648,22 +614,7 @@ public class Capture {
 
                 acquired = true;
                 UpdatePointerMetadata(frameInfo);
-
-                using (var frameTexture = desktopResource.QueryInterface<ID3D11Texture2D>()) {
-                    context.CopyResource(stagingTexture, frameTexture);
-                }
-
-                var mapped = context.Map(stagingTexture, 0, MapMode.Read, MapFlags.None);
-                try {
-                    CopyMappedToBitmap(
-                        mapped.DataPointer,
-                        (int)mapped.RowPitch,
-                        desktopBitmap,
-                        captureSize.Width,
-                        captureSize.Height);
-                } finally {
-                    context.Unmap(stagingTexture, 0);
-                }
+                CopyFrameToBitmap(desktopResource, desktopBitmap);
             } catch {
                 // Pointer metadata will arrive on a later frame
             } finally {
@@ -688,6 +639,43 @@ public class Capture {
                 BindFlags = BindFlags.None
             };
             stagingTexture = device.CreateTexture2D(desc);
+        }
+
+        private void CopyFrameToBitmap(IDXGIResource desktopResource, Bitmap target) {
+            if (canMapDesktopSurface) {
+                try {
+                    var mappedSurface = duplication.MapDesktopSurface();
+                    try {
+                        CopyMappedToBitmap(
+                            mappedSurface.DataPointer,
+                            (int)mappedSurface.Pitch,
+                            target,
+                            captureSize.Width,
+                            captureSize.Height);
+                        return;
+                    } finally {
+                        duplication.UnMapDesktopSurface();
+                    }
+                } catch {
+                    canMapDesktopSurface = false;
+                }
+            }
+
+            using (var frameTexture = desktopResource.QueryInterface<ID3D11Texture2D>()) {
+                context.CopyResource(stagingTexture, frameTexture);
+            }
+
+            var mapped = context.Map(stagingTexture, 0, MapMode.Read, MapFlags.None);
+            try {
+                CopyMappedToBitmap(
+                    mapped.DataPointer,
+                    (int)mapped.RowPitch,
+                    target,
+                    captureSize.Width,
+                    captureSize.Height);
+            } finally {
+                context.Unmap(stagingTexture, 0);
+            }
         }
 
         private void RefreshPointerPosition() {
@@ -728,8 +716,7 @@ public class Capture {
 
         protected override void DrawPointerOverlay() {
             RefreshPointerPosition();
-            // The DXGI pointer-shape path can fail silently on some desktops.
-            // Always use the GDI cursor overlay as the visible fallback.
+            // Cursor is sent as metadata so Android can render it independently of video frames.
             base.DrawPointerOverlay();
         }
 
@@ -754,17 +741,20 @@ public class Capture {
             return false;
         }
 
-        public override void CaptureFrame(MemoryStream ms, ImageCodecInfo jpegCodec, EncoderParameters encoderParams) {
+        protected override bool CaptureFrameIntoBitmap() {
             if (duplication == null) throw new InvalidOperationException("DXGI not initialized");
 
             IDXGIResource desktopResource = null;
             bool acquired = false;
             try {
-                var result = duplication.AcquireNextFrame(16, out var frameInfo, out desktopResource);
+                var result = duplication.AcquireNextFrame(DXGI_FRAME_TIMEOUT_MS, out var frameInfo, out desktopResource);
                 if (result.Failure) {
                     if (result.Code == DXGI_ERROR_WAIT_TIMEOUT) {
-                        EncodeFrame(ms, jpegCodec, encoderParams);
-                        return;
+                        if (!emittedInitialFrame) {
+                            emittedInitialFrame = true;
+                            return true;
+                        }
+                        return false;
                     }
                     if (result.Code == DXGI_ERROR_ACCESS_LOST) {
                         throw new InvalidOperationException("DXGI access lost");
@@ -775,23 +765,10 @@ public class Capture {
                 acquired = true;
                 UpdatePointerMetadata(frameInfo);
 
-                using (var frameTexture = desktopResource.QueryInterface<ID3D11Texture2D>()) {
-                    context.CopyResource(stagingTexture, frameTexture);
-                }
+                CopyFrameToBitmap(desktopResource, desktopBitmap);
 
-                var mapped = context.Map(stagingTexture, 0, MapMode.Read, MapFlags.None);
-                try {
-                    CopyMappedToBitmap(
-                        mapped.DataPointer,
-                        (int)mapped.RowPitch,
-                        desktopBitmap,
-                        captureSize.Width,
-                        captureSize.Height);
-                } finally {
-                    context.Unmap(stagingTexture, 0);
-                }
-
-                EncodeFrame(ms, jpegCodec, encoderParams);
+                emittedInitialFrame = true;
+                return true;
             } finally {
                 if (acquired) {
                     duplication.ReleaseFrame();
@@ -848,7 +825,7 @@ public class Capture {
         private int srcY;
 
         public override void Initialize(int monitorIndex) {
-            var screens = Screen.AllScreens;
+            var screens = GetOrderedScreens();
             if (monitorIndex < 0 || monitorIndex >= screens.Length) monitorIndex = 0;
             var screen = screens[monitorIndex];
             var bounds = screen.Bounds;
@@ -871,11 +848,12 @@ public class Capture {
             EnsureBitmaps(width, height);
         }
 
-        public override void CaptureFrame(MemoryStream ms, ImageCodecInfo jpegCodec, EncoderParameters encoderParams) {
+        protected override bool CaptureFrameIntoBitmap() {
             using (Graphics g = Graphics.FromImage(desktopBitmap)) {
                 g.CopyFromScreen(srcX, srcY, 0, 0, captureSize, CopyPixelOperation.SourceCopy);
             }
-            EncodeFrame(ms, jpegCodec, encoderParams);
+            return true;
         }
+
     }
 }
