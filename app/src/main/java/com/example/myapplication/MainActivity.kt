@@ -48,9 +48,8 @@ import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
 
-    private var testPatternService: TestPatternService? = null
+    private var externalDisplayService: ExternalDisplayService? = null
     private var isBound by mutableStateOf(false)
-    private var currentPattern by mutableStateOf(TestPattern.COLOR_BARS)
     private var discoveredMachines by mutableStateOf<List<DiscoveredMachine>>(emptyList())
     private var activeMachine by mutableStateOf<DiscoveredMachine?>(null)
 
@@ -58,15 +57,14 @@ class MainActivity : ComponentActivity() {
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(className: ComponentName, service: IBinder) {
-            val binder = service as TestPatternService.LocalBinder
-            testPatternService = binder.getService()
+            val binder = service as ExternalDisplayService.LocalBinder
+            externalDisplayService = binder.getService()
             isBound = true
-            currentPattern = testPatternService?.currentPattern ?: TestPattern.COLOR_BARS
         }
 
         override fun onServiceDisconnected(arg0: ComponentName) {
             isBound = false
-            testPatternService = null
+            externalDisplayService = null
         }
     }
 
@@ -91,7 +89,7 @@ class MainActivity : ComponentActivity() {
         }
         machineDiscovery.start()
 
-        val intent = Intent(this, TestPatternService::class.java)
+        val intent = Intent(this, ExternalDisplayService::class.java)
         startService(intent)
         bindService(intent, connection, BIND_AUTO_CREATE)
 
@@ -102,30 +100,26 @@ class MainActivity : ComponentActivity() {
                     if (machine == null) {
                         HomeScreen(
                             discoveredMachines = discoveredMachines,
-                            selectedPattern = currentPattern,
-                            onPatternSelected = { pattern ->
-                                currentPattern = pattern
-                                testPatternService?.currentPattern = pattern
-                            },
                             onMachineSelected = { 
                                 activeMachine = it
-                                testPatternService?.activeMachine = it
-                                testPatternService?.currentPattern = TestPattern.REMOTE_SCREEN
+                                externalDisplayService?.activeMachine = it
+                                externalDisplayService?.currentState = ExternalDisplayState.REMOTE_SCREEN
                             },
                             modifier = Modifier.padding(innerPadding)
                         )
                     } else {
                         ScreenSharingScreen(
                             machine = machine,
-                            currentFps = testPatternService?.currentFps ?: 0,
-                            currentKbps = testPatternService?.currentKbps ?: 0,
+                            currentFps = externalDisplayService?.currentFps ?: 0,
+                            currentKbps = externalDisplayService?.currentKbps ?: 0,
+                            currentCaptureMethod = externalDisplayService?.currentCaptureMethod ?: "Loading...",
                             onStop = { 
                                 activeMachine = null
-                                testPatternService?.activeMachine = null
-                                testPatternService?.currentPattern = currentPattern
+                                externalDisplayService?.activeMachine = null
+                                externalDisplayService?.currentState = ExternalDisplayState.IDLE
                             },
                             onMonitorSwitch = { index ->
-                                testPatternService?.monitorIndex = index
+                                externalDisplayService?.monitorIndex = index
                             },
                             modifier = Modifier.padding(innerPadding)
                         )
@@ -148,8 +142,6 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun HomeScreen(
     discoveredMachines: List<DiscoveredMachine>,
-    selectedPattern: TestPattern,
-    onPatternSelected: (TestPattern) -> Unit,
     onMachineSelected: (DiscoveredMachine) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -177,12 +169,6 @@ fun HomeScreen(
                 Spacer(modifier = Modifier.height(8.dp))
             }
         }
-
-        Spacer(modifier = Modifier.height(24.dp))
-        DebugControls(
-            selectedPattern = selectedPattern,
-            onPatternSelected = onPatternSelected
-        )
     }
 }
 
@@ -215,6 +201,7 @@ fun ScreenSharingScreen(
     machine: DiscoveredMachine,
     currentFps: Int,
     currentKbps: Int,
+    currentCaptureMethod: String,
     onStop: () -> Unit,
     onMonitorSwitch: (Int) -> Unit,
     modifier: Modifier = Modifier
@@ -249,6 +236,7 @@ fun ScreenSharingScreen(
                 Text(text = "Stats for Nerds", style = MaterialTheme.typography.labelLarge)
                 Text(text = "Stream FPS: $currentFps", color = if (currentFps > 100) Color.Green else Color.Unspecified, style = MaterialTheme.typography.bodySmall)
                 Text(text = "Bitrate: $currentKbps kbps", color = if (currentKbps > 5000) Color.Yellow else Color.Unspecified, style = MaterialTheme.typography.bodySmall)
+                Text(text = "Capture: $currentCaptureMethod", style = MaterialTheme.typography.bodySmall)
                 Text(text = "Target: 60Hz (DXGI capture)", style = MaterialTheme.typography.bodySmall)
                 Text(text = "Connection: WebSocket (Binary)", style = MaterialTheme.typography.bodySmall)
                 Text(text = "Encoder: H.264 GPU low-latency", style = MaterialTheme.typography.bodySmall)
@@ -303,26 +291,3 @@ fun ScreenSharingScreen(
     }
 }
 
-@Composable
-fun DebugControls(
-    selectedPattern: TestPattern,
-    onPatternSelected: (TestPattern) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Column(modifier = modifier.fillMaxWidth()) {
-        Text(text = "External Display Debug Controls", style = MaterialTheme.typography.titleLarge)
-        Spacer(modifier = Modifier.height(16.dp))
-
-        TestPattern.entries.forEach { pattern ->
-            Button(
-                onClick = { onPatternSelected(pattern) },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 4.dp),
-                enabled = selectedPattern != pattern
-            ) {
-                Text(text = pattern.name.replace("_", " "))
-            }
-        }
-    }
-}

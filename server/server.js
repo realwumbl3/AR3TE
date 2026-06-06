@@ -2,7 +2,7 @@ const dgram = require("dgram");
 const os = require("os");
 const http = require("http");
 const fs = require("fs");
-const { spawn, execSync } = require("child_process");
+const { spawn, execSync, execFileSync } = require("child_process");
 const path = require("path");
 const { WebSocketServer } = require("ws");
 
@@ -180,6 +180,7 @@ const ffmpegCandidates = [
 const captureEncoders = ["h264_nvenc"];
 let captureProcess = null;
 let rawCaptureProcess = null;
+let cursorCaptureProcess = null;
 let shuttingDown = false;
 let activeMonitorIndex = 0;
 let activeMonitorInfo = null;
@@ -197,6 +198,9 @@ let loggedFirstFrame = false;
 let restartRequested = false;
 let rawCaptureStderrBuffer = "";
 let lastCursorMessage = null;
+let currentCaptureMethod = "";
+let directCaptureAllowed = true;
+let wss = null;
 
 function findExecutable(candidates) {
   for (const candidate of candidates) {
@@ -277,6 +281,33 @@ function getMonitorInfo(index) {
   return monitor;
 }
 
+function probeMonitorForDirectCapture(index) {
+  const captureExe = path.join(__dirname, "Capture.exe");
+  const output = execFileSync(
+    captureExe,
+    ["--probe", "--monitor", String(index + 1)],
+    {
+      encoding: "utf8",
+      windowsHide: true,
+    }
+  ).trim();
+
+  const probe = JSON.parse(output);
+  if (
+    !probe ||
+    !Number.isInteger(probe.adapterIndex) ||
+    !Number.isInteger(probe.outputIndex) ||
+    !Number.isFinite(probe.x) ||
+    !Number.isFinite(probe.y) ||
+    !Number.isFinite(probe.width) ||
+    !Number.isFinite(probe.height)
+  ) {
+    throw new Error(`Invalid probe data for monitor ${index + 1}`);
+  }
+
+  return probe;
+}
+
 function resetStreamState() {
   nalBuffer = Buffer.alloc(0);
   currentAccessUnit = [];
@@ -297,8 +328,16 @@ function stopRawCaptureProcess() {
   rawCaptureProcess = null;
 }
 
+function stopCursorCaptureProcess() {
+  if (cursorCaptureProcess && !cursorCaptureProcess.killed) {
+    cursorCaptureProcess.kill();
+  }
+  cursorCaptureProcess = null;
+}
+
 function stopCaptureProcess() {
   stopRawCaptureProcess();
+  stopCursorCaptureProcess();
   if (captureProcess && !captureProcess.killed) {
     captureProcess.kill();
   }
@@ -309,6 +348,9 @@ function sendBinary(frame) {
     console.log(`First video payload sent (${frame.length} bytes)`);
     loggedFirstFrame = true;
   }
+  if (!wss) {
+    return;
+  }
   wss.clients.forEach((client) => {
     if (client.readyState === 1) { // OPEN
       client.send(frame);
@@ -317,6 +359,9 @@ function sendBinary(frame) {
 }
 
 function broadcastText(message) {
+  if (!wss) {
+    return;
+  }
   wss.clients.forEach((client) => {
     if (client.readyState === 1) {
       client.send(message);
@@ -334,6 +379,17 @@ function sendVideoConfig() {
   );
   broadcastText(JSON.stringify(lastVideoConfig));
   sentVideoConfig = true;
+}
+
+function sendCaptureStatus() {
+  if (!currentCaptureMethod) {
+    return;
+  }
+  broadcastText(JSON.stringify({
+    type: "capture_status",
+    monitor: activeMonitorIndex + 1,
+    method: currentCaptureMethod,
+  }));
 }
 
 function sendStreamReset() {
@@ -423,6 +479,7 @@ function handleNalUnit(nal) {
         height: (activeVideoInfo || activeMonitorInfo).height,
         fps: 60,
         encoder: currentEncoderName,
+        capture_method: currentCaptureMethod,
         sps: lastSps.toString("base64"),
         pps: lastPps.toString("base64"),
         config: avcConfig ? avcConfig.toString("base64") : null,
@@ -443,6 +500,7 @@ function handleNalUnit(nal) {
         height: (activeVideoInfo || activeMonitorInfo).height,
         fps: 60,
         encoder: currentEncoderName,
+        capture_method: currentCaptureMethod,
         sps: lastSps.toString("base64"),
         pps: lastPps.toString("base64"),
         config: avcConfig ? avcConfig.toString("base64") : null,
@@ -533,9 +591,9 @@ function parseAnnexBStream(chunk) {
   }
 }
 
-function getStreamSize(monitorInfo) {
-  const maxWidth = 2560;
-  const maxHeight = 1440;
+function getStreamSize(monitorInfo, monitorIndex) {
+  const maxWidth = monitorIndex === 0 ? 2560 : 1280;
+  const maxHeight = monitorIndex === 0 ? 1440 : 720;
   const scale = Math.min(maxWidth / monitorInfo.width, maxHeight / monitorInfo.height);
   if (scale >= 1) {
     return { width: monitorInfo.width, height: monitorInfo.height };
@@ -558,7 +616,7 @@ function buildRawFfmpegArgs(encoderName, videoInfo) {
     "-f",
     "rawvideo",
     "-pix_fmt",
-    "bgra",
+    "bgr0",
     "-video_size",
     `${videoInfo.width}x${videoInfo.height}`,
     "-framerate",
@@ -566,13 +624,45 @@ function buildRawFfmpegArgs(encoderName, videoInfo) {
     "-i",
     "pipe:0",
     "-an",
-    "-vf",
-    "format=nv12",
   ];
+
+  if (encoderName === "h264_nvenc") {
+    return common.concat([
+      "-vf",
+      `scale=${videoInfo.width}:${videoInfo.height}:flags=fast_bilinear,format=nv12`,
+      "-c:v",
+      "h264_nvenc",
+      "-preset",
+      "p1",
+      "-tune",
+      "ll",
+      "-rc",
+      "vbr",
+      "-cq",
+      "19",
+      "-b:v",
+      "0",
+      "-g",
+      "30",
+      "-bf",
+      "0",
+      "-zerolatency",
+      "1",
+      "-aud",
+      "1",
+      "-bsf:v",
+      "dump_extra,h264_metadata=aud=insert",
+      "-f",
+      "h264",
+      "pipe:1",
+    ]);
+  }
 
   return common.concat([
     "-c:v",
     encoderName,
+    "-vf",
+    "format=nv12",
     "-profile:v",
     "baseline",
     "-preset",
@@ -601,9 +691,62 @@ function buildRawFfmpegArgs(encoderName, videoInfo) {
   ]);
 }
 
+function buildDirectFfmpegArgs(probeInfo, videoInfo) {
+  const captureInput = [
+    `ddagrab=output_idx=${probeInfo.outputIndex}`,
+    `framerate=60`,
+    `video_size=${probeInfo.width}x${probeInfo.height}`,
+    "offset_x=0",
+    "offset_y=0",
+    "draw_mouse=0",
+    "output_fmt=bgra",
+    "allow_fallback=1",
+  ].join(":");
+
+  return [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-init_hw_device",
+    `d3d11va=dxgi:${probeInfo.adapterIndex}`,
+    "-filter_hw_device",
+    "dxgi",
+    "-f",
+    "lavfi",
+    "-i",
+    captureInput,
+    "-an",
+    "-c:v",
+    "h264_nvenc",
+    "-preset",
+    "p1",
+    "-tune",
+    "ll",
+    "-rc",
+    "vbr",
+    "-cq",
+    "19",
+    "-b:v",
+    "0",
+    "-g",
+    "30",
+    "-bf",
+    "0",
+    "-zerolatency",
+    "1",
+    "-aud",
+    "1",
+    "-bsf:v",
+    "dump_extra,h264_metadata=aud=insert",
+    "-f",
+    "h264",
+    "pipe:1",
+  ];
+}
+
 let currentEncoderName = captureEncoders[0];
 
-function startCaptureProcess() {
+function startRawCapturePipeline() {
   if (shuttingDown) {
     return;
   }
@@ -615,13 +758,15 @@ function startCaptureProcess() {
   if (!activeMonitorInfo) {
     activeMonitorInfo = getMonitorInfo(activeMonitorIndex);
   }
+  stopCursorCaptureProcess();
   stopRawCaptureProcess();
-  activeVideoInfo = getStreamSize(activeMonitorInfo);
+  activeVideoInfo = getStreamSize(activeMonitorInfo, activeMonitorIndex);
 
   resetStreamState();
   rawCaptureStderrBuffer = "";
+  currentCaptureMethod = "DXGI duplicate output";
   const captureExe = path.join(__dirname, "Capture.exe");
-  const captureArgs = ["--raw", "--monitor", String(activeMonitorIndex + 1)];
+  const captureArgs = ["--raw", "--monitor", String(activeMonitorIndex + 1), "--stream-size", `${activeVideoInfo.width}x${activeVideoInfo.height}`];
   const ffmpegArgs = buildRawFfmpegArgs(currentEncoderName, activeVideoInfo);
   console.log(
     `Starting raw capture + ${currentEncoderName} on monitor ${activeMonitorIndex + 1} ` +
@@ -629,9 +774,15 @@ function startCaptureProcess() {
       `${activeMonitorInfo.deviceName || ""} ` +
       `(${activeMonitorInfo.width}x${activeMonitorInfo.height} -> ${activeVideoInfo.width}x${activeVideoInfo.height})`
   );
+  sendCaptureStatus();
   rawCaptureProcess = spawn(captureExe, captureArgs, { stdio: ["ignore", "pipe", "pipe"] });
   captureProcess = spawn(ffmpegPath, ffmpegArgs, { stdio: ["pipe", "pipe", "pipe"] });
   rawCaptureProcess.stdout.pipe(captureProcess.stdin);
+  captureProcess.stdin.on("error", (err) => {
+    if (err && err.code !== "EPIPE" && err.code !== "EOF") {
+      console.error(`ffmpeg stdin error: ${err.message || err}`);
+    }
+  });
   rawCaptureProcess.stderr.on("data", (chunk) => {
     handleRawCaptureStderr(chunk);
   });
@@ -658,7 +809,10 @@ function startCaptureProcess() {
       return;
     }
 
-    console.error(`h264 capture exited (code=${code}, signal=${signal})`);
+    console.error(`raw h264 capture exited (code=${code}, signal=${signal})`);
+    try {
+      rawCaptureProcess?.stdout?.unpipe(captureProcess.stdin);
+    } catch {}
     stopRawCaptureProcess();
     if (restartRequested) {
       restartRequested = false;
@@ -676,6 +830,104 @@ function startCaptureProcess() {
   });
 }
 
+function startDirectCapturePipeline() {
+  if (shuttingDown) {
+    return;
+  }
+
+  if (!ffmpegPath) {
+    throw new Error("No ffmpeg runtime found");
+  }
+
+  if (!activeMonitorInfo) {
+    activeMonitorInfo = getMonitorInfo(activeMonitorIndex);
+  }
+
+  stopRawCaptureProcess();
+  stopCursorCaptureProcess();
+  activeVideoInfo = getStreamSize(activeMonitorInfo, activeMonitorIndex);
+
+  let probeInfo;
+  try {
+    probeInfo = probeMonitorForDirectCapture(activeMonitorIndex);
+  } catch (err) {
+    console.error(`Direct pipeline probe failed, falling back to raw capture: ${err.message || err}`);
+    directCaptureAllowed = false;
+    startRawCapturePipeline();
+    return;
+  }
+
+  resetStreamState();
+  rawCaptureStderrBuffer = "";
+  currentCaptureMethod = "Direct D3D11 duplicate output -> NVENC";
+  const captureExe = path.join(__dirname, "Capture.exe");
+  activeVideoInfo = {
+    width: probeInfo.width,
+    height: probeInfo.height,
+  };
+  const cursorArgs = ["--cursor-only", "--monitor", String(activeMonitorIndex + 1), "--stream-size", `${activeVideoInfo.width}x${activeVideoInfo.height}`];
+  const ffmpegArgs = buildDirectFfmpegArgs(probeInfo, activeVideoInfo);
+  console.log(
+    `Starting direct GPU capture + ${currentEncoderName} on monitor ${activeMonitorIndex + 1} ` +
+      `(${probeInfo.deviceName || activeMonitorInfo.deviceName || ""}) ` +
+      `adapter ${probeInfo.adapterIndex} output ${probeInfo.outputIndex} ` +
+      `(${activeMonitorInfo.width}x${activeMonitorInfo.height} -> ${activeVideoInfo.width}x${activeVideoInfo.height})`
+  );
+  sendCaptureStatus();
+  cursorCaptureProcess = spawn(captureExe, cursorArgs, { stdio: ["ignore", "ignore", "pipe"] });
+  captureProcess = spawn(ffmpegPath, ffmpegArgs, { stdio: ["ignore", "pipe", "pipe"] });
+
+  cursorCaptureProcess.stderr.on("data", (chunk) => {
+    handleRawCaptureStderr(chunk);
+  });
+
+  captureProcess.stdout.on("data", (chunk) => {
+    parseAnnexBStream(chunk);
+  });
+
+  captureProcess.stderr.on("data", (chunk) => {
+    process.stderr.write(`[ffmpeg] ${chunk.toString("utf8")}`);
+  });
+
+  cursorCaptureProcess.on("exit", (code, signal) => {
+    if (shuttingDown || restartRequested) {
+      return;
+    }
+    console.error(`cursor metadata process exited (code=${code}, signal=${signal})`);
+  });
+
+  captureProcess.on("exit", (code, signal) => {
+    if (shuttingDown) {
+      return;
+    }
+
+    console.error(`direct h264 capture exited (code=${code}, signal=${signal})`);
+    stopCursorCaptureProcess();
+    if (restartRequested) {
+      restartRequested = false;
+      setTimeout(startCaptureProcess, 300);
+      return;
+    }
+
+    if (directCaptureAllowed) {
+      directCaptureAllowed = false;
+      console.error("Direct pipeline failed, switching to raw fallback");
+      setTimeout(startCaptureProcess, 300);
+      return;
+    }
+
+    setTimeout(startCaptureProcess, 1000);
+  });
+}
+
+function startCaptureProcess() {
+  if (directCaptureAllowed) {
+    startDirectCapturePipeline();
+    return;
+  }
+  startRawCapturePipeline();
+}
+
 ffmpegPath = findExecutable(ffmpegCandidates);
 if (!ffmpegPath) {
   throw new Error("No ffmpeg runtime found");
@@ -685,7 +937,7 @@ startCaptureProcess();
 
 // --- WebSocket Server ---
 const server = http.createServer();
-const wss = new WebSocketServer({ server });
+wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws) => {
   console.log("Client connected");
@@ -708,9 +960,11 @@ wss.on("connection", (ws) => {
           activeMonitorIndex = nextMonitor;
           activeMonitorInfo = getMonitorInfo(activeMonitorIndex);
           currentEncoderName = captureEncoders[0];
+          directCaptureAllowed = true;
           sendStreamReset();
           restartRequested = true;
           stopRawCaptureProcess();
+          stopCursorCaptureProcess();
           if (captureProcess && !captureProcess.killed) {
             captureProcess.kill();
           } else {

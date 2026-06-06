@@ -16,16 +16,25 @@ using DrawingSize = System.Drawing.Size;
 public class Capture {
     private static volatile int monitorIndex = 0;
     private static volatile bool running = true;
+    private static volatile bool cursorOnly = false;
     private static bool dpiAwarenessEnabled = false;
+    private static int streamMaxWidth = 2560;
+    private static int streamMaxHeight = 1440;
     private static IntPtr lastCursorHandle = IntPtr.Zero;
     private static string lastCursorBase64 = "";
     private static int lastCursorHotX = 0;
     private static int lastCursorHotY = 0;
 
+    private sealed class MonitorProbeInfo {
+        public int AdapterIndex;
+        public int OutputIndex;
+        public string DeviceName;
+        public Rectangle Bounds;
+    }
+
     private const int TARGET_FPS = 60;
+    private const int FRAME_INTERVAL_MS = 1000 / TARGET_FPS;
     private const int DXGI_FRAME_TIMEOUT_MS = 16;
-    private const int MAX_STREAM_WIDTH = 2560;
-    private const int MAX_STREAM_HEIGHT = 1440;
 
     [DllImport("user32.dll")]
     private static extern bool SetProcessDPIAware();
@@ -125,8 +134,8 @@ public class Capture {
 
     private static DrawingSize GetStreamSize(int captureWidth, int captureHeight) {
         double scale = Math.Min(
-            (double)MAX_STREAM_WIDTH / captureWidth,
-            (double)MAX_STREAM_HEIGHT / captureHeight);
+            (double)streamMaxWidth / captureWidth,
+            (double)streamMaxHeight / captureHeight);
         if (scale >= 1.0) {
             return new DrawingSize(captureWidth, captureHeight);
         }
@@ -148,19 +157,111 @@ public class Capture {
         return screens;
     }
 
+    private static string JsonEscape(string value) {
+        if (value == null) {
+            return "";
+        }
+        return value.Replace("\\", "\\\\").Replace("\"", "\\\"");
+    }
+
+    private static MonitorProbeInfo ResolveMonitorProbeInfo(int monitorIndex) {
+        var screens = GetOrderedScreens();
+        if (monitorIndex < 0 || monitorIndex >= screens.Length) monitorIndex = 0;
+        var target = screens[monitorIndex].Bounds;
+
+        var factory = DXGI.CreateDXGIFactory1<IDXGIFactory1>();
+        try {
+            for (uint i = 0; ; i++) {
+                if (factory.EnumAdapters1(i, out var adp).Failure) break;
+                bool keepAdapter = false;
+                try {
+                    for (uint j = 0; ; j++) {
+                        if (adp.EnumOutputs(j, out var outBase).Failure) break;
+                        using (outBase) {
+                            var out1 = outBase.QueryInterface<IDXGIOutput1>();
+                            using (out1) {
+                                var rect = out1.Description.DesktopCoordinates;
+                                if (rect.Left == target.X && rect.Top == target.Y &&
+                                    (rect.Right - rect.Left) == target.Width &&
+                                    (rect.Bottom - rect.Top) == target.Height) {
+                                    return new MonitorProbeInfo {
+                                        AdapterIndex = (int)i,
+                                        OutputIndex = (int)j,
+                                        DeviceName = out1.Description.DeviceName,
+                                        Bounds = target
+                                    };
+                                }
+                            }
+                        }
+                    }
+                } finally {
+                    adp.Dispose();
+                }
+            }
+        } finally {
+            factory.Dispose();
+        }
+
+        return new MonitorProbeInfo {
+            AdapterIndex = 0,
+            OutputIndex = monitorIndex,
+            DeviceName = screens[monitorIndex].DeviceName,
+            Bounds = target
+        };
+    }
+
     public static void Main(string[] args) {
         EnableDpiAwareness();
+
+        bool probeOnly = false;
 
         for (int i = 0; i < args.Length; i++) {
             if (args[i] == "--raw") {
                 continue;
+            } else if (args[i] == "--probe") {
+                probeOnly = true;
+            } else if (args[i] == "--cursor-only") {
+                cursorOnly = true;
             } else if (args[i] == "--monitor" && i + 1 < args.Length) {
                 int newIndex;
                 if (int.TryParse(args[i + 1], out newIndex)) {
                     monitorIndex = newIndex - 1;
                 }
                 i++;
+            } else if (args[i] == "--stream-size" && i + 1 < args.Length) {
+                var parts = args[i + 1].Split('x');
+                if (parts.Length == 2 &&
+                    int.TryParse(parts[0], out var parsedWidth) &&
+                    int.TryParse(parts[1], out var parsedHeight) &&
+                    parsedWidth > 0 &&
+                    parsedHeight > 0) {
+                    streamMaxWidth = parsedWidth;
+                    streamMaxHeight = parsedHeight;
+                }
+                i++;
             }
+        }
+
+        if (probeOnly) {
+            var probe = ResolveMonitorProbeInfo(monitorIndex);
+            Console.Out.WriteLine(
+                "{"
+                + $"\"monitor\":{monitorIndex + 1},"
+                + $"\"adapterIndex\":{probe.AdapterIndex},"
+                + $"\"outputIndex\":{probe.OutputIndex},"
+                + $"\"deviceName\":\"{JsonEscape(probe.DeviceName)}\","
+                + $"\"x\":{probe.Bounds.X},"
+                + $"\"y\":{probe.Bounds.Y},"
+                + $"\"width\":{probe.Bounds.Width},"
+                + $"\"height\":{probe.Bounds.Height}"
+                + "}"
+            );
+            return;
+        }
+
+        if (cursorOnly) {
+            RunCursorOnlyLoop();
+            return;
         }
 
         using (var stdout = Console.OpenStandardOutput()) {
@@ -172,6 +273,8 @@ public class Capture {
                 capturer = new GdiCapturer();
             }
 
+            var frameTimer = Stopwatch.StartNew();
+            long nextFrameMs = 0;
             int activeMonitor = -1;
 
             while (running) {
@@ -195,6 +298,14 @@ public class Capture {
                         continue;
                     }
                     stdout.Flush();
+
+                    nextFrameMs += FRAME_INTERVAL_MS;
+                    long sleepMs = nextFrameMs - frameTimer.ElapsedMilliseconds;
+                    if (sleepMs > 0) {
+                        Thread.Sleep((int)sleepMs);
+                    } else if (sleepMs < -FRAME_INTERVAL_MS * 2) {
+                        nextFrameMs = frameTimer.ElapsedMilliseconds;
+                    }
                 } catch (Exception ex) {
                     try {
                         Console.Error.WriteLine(ex.ToString());
@@ -212,7 +323,7 @@ public class Capture {
         }
     }
 
-    private static void DrawCursorOnBitmap(Bitmap bitmap, int monitorX, int monitorY, int monitorWidth, int monitorHeight) {
+    private static void EmitCursorMetadataForRegion(int monitorX, int monitorY, int monitorWidth, int monitorHeight, int sourceWidth, int sourceHeight) {
         CURSORINFO cursorInfo = new CURSORINFO();
         cursorInfo.cbSize = Marshal.SizeOf(typeof(CURSORINFO));
 
@@ -230,7 +341,7 @@ public class Capture {
         }
 
         if (!cursorVisible || cursorHandle == IntPtr.Zero) {
-            EmitCursorMetadata(false, 0, 0, bitmap.Width, bitmap.Height, null, 0, 0);
+            EmitCursorMetadata(false, 0, 0, sourceWidth, sourceHeight, null, 0, 0);
             return;
         }
 
@@ -238,16 +349,19 @@ public class Capture {
         int localY = cursorPos.Y - monitorY;
 
         if (localX < 0 || localY < 0 || localX >= monitorWidth || localY >= monitorHeight) {
-            EmitCursorMetadata(false, 0, 0, bitmap.Width, bitmap.Height, null, 0, 0);
+            EmitCursorMetadata(false, 0, 0, sourceWidth, sourceHeight, null, 0, 0);
             return;
         }
+
+        int scaledX = monitorWidth > 0 ? (int)Math.Round((double)localX * sourceWidth / monitorWidth) : localX;
+        int scaledY = monitorHeight > 0 ? (int)Math.Round((double)localY * sourceHeight / monitorHeight) : localY;
 
         int hotX = 0, hotY = 0;
         string cursorBase64 = null;
         ICONINFO iconInfo;
         if (GetIconInfo(cursorHandle, out iconInfo)) {
-            hotX = iconInfo.xHotspot;
-            hotY = iconInfo.yHotspot;
+            hotX = monitorWidth > 0 ? (int)Math.Round((double)iconInfo.xHotspot * sourceWidth / monitorWidth) : iconInfo.xHotspot;
+            hotY = monitorHeight > 0 ? (int)Math.Round((double)iconInfo.yHotspot * sourceHeight / monitorHeight) : iconInfo.yHotspot;
 
             if (cursorHandle != lastCursorHandle || string.IsNullOrEmpty(lastCursorBase64)) {
                 Bitmap cursorBitmap = null;
@@ -296,7 +410,32 @@ public class Capture {
             if (iconInfo.hbmMask != IntPtr.Zero) DeleteObject(iconInfo.hbmMask);
         }
 
-        EmitCursorMetadata(true, localX, localY, bitmap.Width, bitmap.Height, cursorBase64, hotX, hotY);
+        EmitCursorMetadata(true, scaledX, scaledY, sourceWidth, sourceHeight, cursorBase64, hotX, hotY);
+    }
+
+    private static void RunCursorOnlyLoop() {
+        var screens = GetOrderedScreens();
+        if (monitorIndex < 0 || monitorIndex >= screens.Length) monitorIndex = 0;
+        var screen = screens[monitorIndex];
+        var bounds = screen.Bounds;
+        var sourceSize = new DrawingSize(streamMaxWidth, streamMaxHeight);
+        int monitorX = bounds.X;
+        int monitorY = bounds.Y;
+
+        Console.Error.WriteLine($"Cursor metadata loop started for monitor {monitorIndex + 1} Source={sourceSize.Width}x{sourceSize.Height}");
+        Console.Error.Flush();
+
+        while (running) {
+            try {
+                EmitCursorMetadataForRegion(monitorX, monitorY, bounds.Width, bounds.Height, sourceSize.Width, sourceSize.Height);
+                Thread.Sleep(FRAME_INTERVAL_MS);
+            } catch (Exception ex) {
+                try {
+                    Console.Error.WriteLine(ex.ToString());
+                    Console.Error.Flush();
+                } catch { }
+            }
+        }
     }
 
     private static void EmitCursorMetadata(bool visible, int x, int y, int width, int height, string base64, int hotX, int hotY) {
@@ -328,6 +467,10 @@ public class Capture {
         } finally {
             source.UnlockBits(srcData);
         }
+    }
+
+    private static void DrawCursorOnBitmap(Bitmap bitmap, int monitorX, int monitorY, int monitorWidth, int monitorHeight) {
+        EmitCursorMetadataForRegion(monitorX, monitorY, monitorWidth, monitorHeight, bitmap.Width, bitmap.Height);
     }
 
     private static unsafe void AlphaBlendBgraOntoBitmap(Bitmap bitmap, int destX, int destY, byte[] src, int width, int height, int pitch) {
@@ -530,7 +673,6 @@ public class Capture {
         private int pointerY;
         private bool canMapDesktopSurface;
         private bool emittedInitialFrame;
-        private int gdiBootstrapFramesRemaining;
 
         public override void Initialize(int monitorIndex) {
             DisposeDxgi();
@@ -590,7 +732,7 @@ public class Capture {
             var desc = duplication.Description;
             int width = (int)desc.ModeDescription.Width;
             int height = (int)desc.ModeDescription.Height;
-            canMapDesktopSurface = desc.DesktopImageInSystemMemory;
+            canMapDesktopSurface = true;
             emittedInitialFrame = false;
 
             var outputDesc = output.Description;
@@ -600,7 +742,6 @@ public class Capture {
             Console.Error.WriteLine($"DXGI Initialized: Output={output.Description.DeviceName} Origin={monitorOriginX},{monitorOriginY} Size={width}x{height}");
             Console.Error.Flush();
 
-            gdiBootstrapFramesRemaining = 8;
             EnsureBitmaps(width, height);
             CreateStagingTexture(width, height);
             BootstrapPointerShape();
@@ -759,14 +900,6 @@ public class Capture {
         protected override bool CaptureFrameIntoBitmap() {
             if (duplication == null) throw new InvalidOperationException("DXGI not initialized");
 
-            if (gdiBootstrapFramesRemaining > 0) {
-                CaptureScreenSnapshot(desktopBitmap);
-                UpdatePointerMetadataFromCursor();
-                gdiBootstrapFramesRemaining--;
-                emittedInitialFrame = true;
-                return true;
-            }
-
             IDXGIResource desktopResource = null;
             bool acquired = false;
             try {
@@ -778,7 +911,7 @@ public class Capture {
                             emittedInitialFrame = true;
                             return true;
                         }
-                        return false;
+                        return true;
                     }
                     if (result.Code == DXGI_ERROR_ACCESS_LOST) {
                         throw new InvalidOperationException("DXGI access lost");
@@ -799,15 +932,6 @@ public class Capture {
                 }
                 if (desktopResource != null) desktopResource.Dispose();
             }
-        }
-
-        private void UpdatePointerMetadataFromCursor() {
-            POINT cursorPos;
-            if (!GetCursorPos(out cursorPos)) {
-                return;
-            }
-            pointerX = cursorPos.X - monitorOriginX;
-            pointerY = cursorPos.Y - monitorOriginY;
         }
 
         private void CopyMappedToBitmap(IntPtr source, int srcStride, Bitmap target, int width, int height) {

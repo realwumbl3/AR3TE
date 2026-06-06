@@ -13,7 +13,6 @@ import android.util.Base64
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -36,7 +35,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import com.example.myapplication.discovery.DiscoveredMachine
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.ComposeView
@@ -73,8 +71,8 @@ import androidx.savedstate.SavedStateRegistryController
 import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 
-enum class TestPattern {
-    COLOR_BARS, GRID, SOLID_RED, SOLID_GREEN, SOLID_BLUE, REMOTE_SCREEN
+enum class ExternalDisplayState {
+    IDLE, REMOTE_SCREEN
 }
 
 private const val REMOTE_TAG = "RemoteScreenView"
@@ -106,7 +104,7 @@ data class RemoteCursorState(
     val hotY: Int = 0
 )
 
-class TestPatternPresentation(
+class ExternalDisplayPresentation(
     outerContext: Context,
     display: Display
 ) : Presentation(outerContext, display), LifecycleOwner, SavedStateRegistryOwner, ViewModelStoreOwner {
@@ -119,10 +117,11 @@ class TestPatternPresentation(
     override val savedStateRegistry: SavedStateRegistry = savedStateRegistryController.savedStateRegistry
     override val viewModelStore: ViewModelStore = store
 
-    var pattern by mutableStateOf(TestPattern.COLOR_BARS)
+    var displayState by mutableStateOf(ExternalDisplayState.IDLE)
     var activeMachine by mutableStateOf<DiscoveredMachine?>(null)
     var monitorIndex by mutableIntStateOf(1)
-    var onStatsUpdated: ((Int, Int) -> Unit)? = null
+    var onStatsUpdated: ((Int, Int, String?) -> Unit)? = null
+    var onCaptureMethodUpdated: ((String) -> Unit)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -130,11 +129,11 @@ class TestPatternPresentation(
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
 
         val composeView = ComposeView(context).apply {
-            setViewTreeLifecycleOwner(this@TestPatternPresentation)
-            setViewTreeSavedStateRegistryOwner(this@TestPatternPresentation)
-            setViewTreeViewModelStoreOwner(this@TestPatternPresentation)
+            setViewTreeLifecycleOwner(this@ExternalDisplayPresentation)
+            setViewTreeSavedStateRegistryOwner(this@ExternalDisplayPresentation)
+            setViewTreeViewModelStoreOwner(this@ExternalDisplayPresentation)
             setContent {
-                TestPatternScreen(pattern, activeMachine, monitorIndex, onStatsUpdated)
+                ExternalDisplayScreen(displayState, activeMachine, monitorIndex, onStatsUpdated, onCaptureMethodUpdated)
             }
         }
         
@@ -153,24 +152,56 @@ class TestPatternPresentation(
 }
 
 @Composable
-fun TestPatternScreen(pattern: TestPattern, machine: DiscoveredMachine? = null, monitorIndex: Int = 1, onStatsUpdated: ((Int, Int) -> Unit)? = null) {
-    when (pattern) {
-        TestPattern.COLOR_BARS -> ColorBars()
-        TestPattern.GRID -> GridPattern()
-        TestPattern.SOLID_RED -> Box(Modifier.fillMaxSize().background(Color.Red))
-        TestPattern.SOLID_GREEN -> Box(Modifier.fillMaxSize().background(Color.Green))
-        TestPattern.SOLID_BLUE -> Box(Modifier.fillMaxSize().background(Color.Blue))
-        TestPattern.REMOTE_SCREEN -> key(machine?.host, monitorIndex) {
-            RemoteScreenView(machine, monitorIndex, onStatsUpdated)
+fun ExternalDisplayScreen(
+    state: ExternalDisplayState,
+    machine: DiscoveredMachine? = null,
+    monitorIndex: Int = 1,
+    onStatsUpdated: ((Int, Int, String?) -> Unit)? = null,
+    onCaptureMethodUpdated: ((String) -> Unit)? = null
+) {
+    when (state) {
+        ExternalDisplayState.IDLE -> IdleScreen()
+        ExternalDisplayState.REMOTE_SCREEN -> key(machine?.host, monitorIndex) {
+            RemoteScreenView(machine, monitorIndex, onStatsUpdated, onCaptureMethodUpdated)
         }
     }
 }
 
 @Composable
-fun RemoteScreenView(machine: DiscoveredMachine?, monitorIndex: Int, onStatsUpdated: ((Int, Int) -> Unit)? = null) {
+fun IdleScreen() {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                text = "READY TO CONNECT",
+                color = Color.DarkGray,
+                style = MaterialTheme.typography.displayLarge
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                text = "Select a computer on your phone to start sharing",
+                color = Color.DarkGray,
+                style = MaterialTheme.typography.headlineSmall
+            )
+        }
+    }
+}
+
+@Composable
+fun RemoteScreenView(
+    machine: DiscoveredMachine?,
+    monitorIndex: Int,
+    onStatsUpdated: ((Int, Int, String?) -> Unit)? = null,
+    onCaptureMethodUpdated: ((String) -> Unit)? = null
+) {
     val scope = rememberCoroutineScope()
     var client by remember(machine, monitorIndex) { mutableStateOf<WebSocketClient?>(null) }
     var videoConfig by remember(machine, monitorIndex) { mutableStateOf<H264StreamConfig?>(null) }
+    var captureMethod by remember(machine, monitorIndex) { mutableStateOf<String?>(null) }
     var cursor by remember(machine, monitorIndex) { mutableStateOf<RemoteCursorState?>(null) }
     var viewSize by remember(machine, monitorIndex) { mutableStateOf(IntSize.Zero) }
     val decoderController = remember(machine, monitorIndex) { H264StreamController(scope) }
@@ -196,7 +227,7 @@ fun RemoteScreenView(machine: DiscoveredMachine?, monitorIndex: Int, onStatsUpda
                         val fps = frameCount
                         val kbps = ((byteCount * 8) / 1024).toInt()
                         withContext(Dispatchers.Main) {
-                            onStatsUpdated?.invoke(fps, kbps)
+                            onStatsUpdated?.invoke(fps, kbps, captureMethod)
                         }
                         debugLog(REMOTE_TAG, "Stream stats: fps=$fps kbps=$kbps queuedBytes=$byteCount")
                         frameCount = 0
@@ -226,8 +257,18 @@ fun RemoteScreenView(machine: DiscoveredMachine?, monitorIndex: Int, onStatsUpda
                                 debugLog(REMOTE_TAG, "stream_reset received for monitor $resetMonitor")
                                 scope.launch(Dispatchers.Main) {
                                     videoConfig = null
+                                    captureMethod = null
                                     cursor = null
                                     decoderController.resetStream()
+                                }
+                            }
+                            "capture_status" -> {
+                                val method = json.optString("method", "").takeIf { it.isNotBlank() }
+                                if (method != null) {
+                                    scope.launch(Dispatchers.Main) {
+                                        captureMethod = method
+                                        onCaptureMethodUpdated?.invoke(method)
+                                    }
                                 }
                             }
                             "cursor" -> {
@@ -274,16 +315,19 @@ fun RemoteScreenView(machine: DiscoveredMachine?, monitorIndex: Int, onStatsUpda
                                     height = json.getInt("height"),
                                     fps = json.optInt("fps", 60),
                                     encoder = json.optString("encoder", "unknown"),
+                                    captureMethod = json.optString("capture_method", captureMethod ?: "Loading..."),
                                     sps = sps,
                                     pps = pps,
                                     avcc = avcc
                                 )
                                 debugLog(
                                     REMOTE_TAG,
-                                    "video_config received: ${nextConfig.width}x${nextConfig.height} fps=${nextConfig.fps} encoder=${nextConfig.encoder} sps=${sps.size} pps=${pps.size} avcc=${avcc?.size ?: 0}"
+                                    "video_config received: ${nextConfig.width}x${nextConfig.height} fps=${nextConfig.fps} encoder=${nextConfig.encoder} capture=${nextConfig.captureMethod} sps=${sps.size} pps=${pps.size} avcc=${avcc?.size ?: 0}"
                                 )
                                 scope.launch(Dispatchers.Main) {
                                     videoConfig = nextConfig
+                                    captureMethod = nextConfig.captureMethod
+                                    onCaptureMethodUpdated?.invoke(nextConfig.captureMethod)
                                     decoderController.configure(nextConfig)
                                 }
                             }
@@ -415,6 +459,7 @@ data class H264StreamConfig(
     val height: Int,
     val fps: Int,
     val encoder: String,
+    val captureMethod: String,
     val sps: ByteArray,
     val pps: ByteArray,
     val avcc: ByteArray? = null
@@ -674,45 +719,4 @@ class H264StreamController(
         return false
     }
 
-}
-
-@Composable
-fun ColorBars() {
-    val colors = listOf(
-        Color.White, Color.Yellow, Color.Cyan, Color.Green,
-        Color.Magenta, Color.Red, Color.Blue, Color.Black
-    )
-    Canvas(modifier = Modifier.fillMaxSize()) {
-        val barWidth = size.width / colors.size
-        colors.forEachIndexed { index, color ->
-            drawRect(
-                color = color,
-                topLeft = Offset(index * barWidth, 0f),
-                size = size.copy(width = barWidth)
-            )
-        }
-    }
-}
-
-@Composable
-fun GridPattern() {
-    Canvas(modifier = Modifier.fillMaxSize()) {
-        val step = 50f
-        for (x in 0..size.width.toInt() step step.toInt()) {
-            drawLine(
-                color = Color.Gray,
-                start = Offset(x.toFloat(), 0f),
-                end = Offset(x.toFloat(), size.height),
-                strokeWidth = 1f
-            )
-        }
-        for (y in 0..size.height.toInt() step step.toInt()) {
-            drawLine(
-                color = Color.Gray,
-                start = Offset(0f, y.toFloat()),
-                end = Offset(size.width, y.toFloat()),
-                strokeWidth = 1f
-            )
-        }
-    }
 }

@@ -21,13 +21,13 @@
         android:theme="@style/Theme.MyApplication">
 
         <service
-            android:name=".TestPatternService"
+            android:name=".ExternalDisplayService"
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="External display test pattern generator" />
+                android:value="External display remote screen renderer" />
         </service>
 
         <activity
