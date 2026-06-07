@@ -43,6 +43,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -61,6 +63,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -72,6 +75,8 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.vector.path
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.ar3te.discovery.DiscoveredMachine
@@ -370,7 +375,7 @@ fun HomeScreen(
             .padding(16.dp)
     ) {
         Text(
-            text = "Nearby Computers",
+            text = "AR3TE Hosts",
             style = MaterialTheme.typography.headlineMedium
         )
         Spacer(modifier = Modifier.height(12.dp))
@@ -492,7 +497,7 @@ fun ScreenSharingScreen(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "Screen Sharing",
+                    text = "AR3TE Display",
                     style = MaterialTheme.typography.headlineSmall
                 )
                 Text(
@@ -501,14 +506,27 @@ fun ScreenSharingScreen(
                 )
             }
             
-            Button(onClick = { 
+            IconButton(onClick = {
+                monitorIndex = if (monitorIndex == 1) 2 else 1
+                onMonitorSwitch(monitorIndex)
+            }) {
+                Icon(
+                    imageVector = MonitorSwitchIcon,
+                    contentDescription = "Switch monitor"
+                )
+            }
+            Spacer(modifier = Modifier.width(4.dp))
+            IconButton(onClick = {
                 focusRequester.requestFocus()
                 keyboardController?.show()
             }) {
-                Text("Kbd")
+                Icon(
+                    imageVector = KeyboardIcon,
+                    contentDescription = "Show keyboard"
+                )
             }
             Spacer(modifier = Modifier.width(4.dp))
-            Button(onClick = {
+            IconButton(onClick = {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     val root = view.rootView
                     root.isFocusable = true
@@ -517,11 +535,17 @@ fun ScreenSharingScreen(
                 }
                 onCaptureToggle(!isPointerCaptured)
             }) {
-                Text(if (isPointerCaptured) "Unlock" else "Lock")
+                Icon(
+                    imageVector = if (isPointerCaptured) UnlockIcon else LockIcon,
+                    contentDescription = if (isPointerCaptured) "Unlock pointer" else "Lock pointer"
+                )
             }
             Spacer(modifier = Modifier.width(4.dp))
-            Button(onClick = { showDebugMenu = !showDebugMenu }) {
-                Text("Debug")
+            IconButton(onClick = { showDebugMenu = !showDebugMenu }) {
+                Icon(
+                    imageVector = BugIcon,
+                    contentDescription = "Debug"
+                )
             }
         }
 
@@ -738,18 +762,285 @@ fun ScreenSharingScreen(
         }
 
         Spacer(modifier = Modifier.height(8.dp))
-
-        Button(
-            onClick = { 
-                monitorIndex = if (monitorIndex == 1) 2 else 1
-                onMonitorSwitch(monitorIndex)
-            },
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Switch Monitor")
-        }
     }
 }
+
+private val MonitorSwitchIcon: ImageVector =
+    ImageVector.Builder(
+        name = "MonitorSwitch",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f
+    ).apply {
+        path(fill = SolidColor(Color.Black)) {
+            moveTo(3f, 5f)
+            horizontalLineTo(21f)
+            verticalLineTo(16f)
+            horizontalLineTo(3f)
+            close()
+            moveTo(5f, 7f)
+            verticalLineTo(14f)
+            horizontalLineTo(19f)
+            verticalLineTo(7f)
+            close()
+            moveTo(9f, 18f)
+            horizontalLineTo(15f)
+            verticalLineTo(20f)
+            horizontalLineTo(9f)
+            close()
+            moveTo(15.5f, 8.5f)
+            lineTo(18f, 11f)
+            lineTo(15.5f, 13.5f)
+            verticalLineTo(12f)
+            horizontalLineTo(12f)
+            verticalLineTo(10f)
+            horizontalLineTo(15.5f)
+            close()
+            moveTo(8.5f, 13.5f)
+            lineTo(6f, 11f)
+            lineTo(8.5f, 8.5f)
+            verticalLineTo(10f)
+            horizontalLineTo(12f)
+            verticalLineTo(12f)
+            horizontalLineTo(8.5f)
+            close()
+        }
+    }.build()
+
+private val KeyboardIcon: ImageVector =
+    ImageVector.Builder(
+        name = "Keyboard",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f
+    ).apply {
+        path(fill = SolidColor(Color.Black)) {
+            moveTo(4f, 5f)
+            horizontalLineTo(20f)
+            curveTo(21.1f, 5f, 22f, 5.9f, 22f, 7f)
+            verticalLineTo(17f)
+            curveTo(22f, 18.1f, 21.1f, 19f, 20f, 19f)
+            horizontalLineTo(4f)
+            curveTo(2.9f, 19f, 2f, 18.1f, 2f, 17f)
+            verticalLineTo(7f)
+            curveTo(2f, 5.9f, 2.9f, 5f, 4f, 5f)
+            close()
+            moveTo(4f, 7f)
+            verticalLineTo(17f)
+            horizontalLineTo(20f)
+            verticalLineTo(7f)
+            close()
+            moveTo(5f, 9f)
+            horizontalLineTo(7f)
+            verticalLineTo(11f)
+            horizontalLineTo(5f)
+            close()
+            moveTo(8f, 9f)
+            horizontalLineTo(10f)
+            verticalLineTo(11f)
+            horizontalLineTo(8f)
+            close()
+            moveTo(11f, 9f)
+            horizontalLineTo(13f)
+            verticalLineTo(11f)
+            horizontalLineTo(11f)
+            close()
+            moveTo(14f, 9f)
+            horizontalLineTo(16f)
+            verticalLineTo(11f)
+            horizontalLineTo(14f)
+            close()
+            moveTo(17f, 9f)
+            horizontalLineTo(19f)
+            verticalLineTo(11f)
+            horizontalLineTo(17f)
+            close()
+            moveTo(5f, 12f)
+            horizontalLineTo(7f)
+            verticalLineTo(14f)
+            horizontalLineTo(5f)
+            close()
+            moveTo(8f, 12f)
+            horizontalLineTo(10f)
+            verticalLineTo(14f)
+            horizontalLineTo(8f)
+            close()
+            moveTo(11f, 12f)
+            horizontalLineTo(13f)
+            verticalLineTo(14f)
+            horizontalLineTo(11f)
+            close()
+            moveTo(14f, 12f)
+            horizontalLineTo(16f)
+            verticalLineTo(14f)
+            horizontalLineTo(14f)
+            close()
+            moveTo(17f, 12f)
+            horizontalLineTo(19f)
+            verticalLineTo(14f)
+            horizontalLineTo(17f)
+            close()
+            moveTo(8f, 15f)
+            horizontalLineTo(16f)
+            verticalLineTo(16f)
+            horizontalLineTo(8f)
+            close()
+        }
+    }.build()
+
+private val LockIcon: ImageVector =
+    ImageVector.Builder(
+        name = "Lock",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f
+    ).apply {
+        path(fill = SolidColor(Color.Black)) {
+            moveTo(7f, 10f)
+            verticalLineTo(8f)
+            curveTo(7f, 5.2f, 9.2f, 3f, 12f, 3f)
+            reflectiveCurveTo(17f, 5.2f, 17f, 8f)
+            verticalLineTo(10f)
+            horizontalLineTo(18f)
+            curveTo(19.1f, 10f, 20f, 10.9f, 20f, 12f)
+            verticalLineTo(20f)
+            horizontalLineTo(4f)
+            verticalLineTo(12f)
+            curveTo(4f, 10.9f, 4.9f, 10f, 6f, 10f)
+            close()
+            moveTo(9f, 10f)
+            horizontalLineTo(15f)
+            verticalLineTo(8f)
+            curveTo(15f, 6.3f, 13.7f, 5f, 12f, 5f)
+            reflectiveCurveTo(9f, 6.3f, 9f, 8f)
+            close()
+            moveTo(6f, 12f)
+            verticalLineTo(18f)
+            horizontalLineTo(18f)
+            verticalLineTo(12f)
+            close()
+        }
+    }.build()
+
+private val UnlockIcon: ImageVector =
+    ImageVector.Builder(
+        name = "Unlock",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f
+    ).apply {
+        path(fill = SolidColor(Color.Black)) {
+            moveTo(8f, 10f)
+            verticalLineTo(8f)
+            curveTo(8f, 5.2f, 10.2f, 3f, 13f, 3f)
+            curveTo(15.4f, 3f, 17.5f, 4.7f, 18f, 7f)
+            horizontalLineTo(16f)
+            curveTo(15.6f, 5.8f, 14.5f, 5f, 13f, 5f)
+            curveTo(11.3f, 5f, 10f, 6.3f, 10f, 8f)
+            verticalLineTo(10f)
+            horizontalLineTo(18f)
+            curveTo(19.1f, 10f, 20f, 10.9f, 20f, 12f)
+            verticalLineTo(20f)
+            horizontalLineTo(4f)
+            verticalLineTo(12f)
+            curveTo(4f, 10.9f, 4.9f, 10f, 6f, 10f)
+            close()
+            moveTo(6f, 12f)
+            verticalLineTo(18f)
+            horizontalLineTo(18f)
+            verticalLineTo(12f)
+            close()
+        }
+    }.build()
+
+private val BugIcon: ImageVector =
+    ImageVector.Builder(
+        name = "Bug",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f
+    ).apply {
+        path(fill = SolidColor(Color.Black)) {
+            moveTo(9f, 4f)
+            curveTo(9f, 2.9f, 9.9f, 2f, 11f, 2f)
+            horizontalLineTo(13f)
+            curveTo(14.1f, 2f, 15f, 2.9f, 15f, 4f)
+            verticalLineTo(5f)
+            horizontalLineTo(16f)
+            curveTo(17.7f, 5f, 19f, 6.3f, 19f, 8f)
+            verticalLineTo(9f)
+            horizontalLineTo(17f)
+            verticalLineTo(8f)
+            curveTo(17f, 7.4f, 16.6f, 7f, 16f, 7f)
+            horizontalLineTo(8f)
+            curveTo(7.4f, 7f, 7f, 7.4f, 7f, 8f)
+            verticalLineTo(9f)
+            horizontalLineTo(5f)
+            verticalLineTo(8f)
+            curveTo(5f, 6.3f, 6.3f, 5f, 8f, 5f)
+            horizontalLineTo(9f)
+            close()
+            moveTo(11f, 4f)
+            verticalLineTo(5f)
+            horizontalLineTo(13f)
+            verticalLineTo(4f)
+            close()
+            moveTo(8f, 10f)
+            horizontalLineTo(16f)
+            curveTo(16.6f, 10f, 17f, 10.4f, 17f, 11f)
+            verticalLineTo(14f)
+            curveTo(17f, 17.3f, 14.3f, 20f, 11f, 20f)
+            curveTo(7.7f, 20f, 5f, 17.3f, 5f, 14f)
+            verticalLineTo(11f)
+            curveTo(5f, 10.4f, 5.4f, 10f, 6f, 10f)
+            close()
+            moveTo(7f, 12f)
+            verticalLineTo(14f)
+            curveTo(7f, 16.2f, 8.8f, 18f, 11f, 18f)
+            curveTo(13.2f, 18f, 15f, 16.2f, 15f, 14f)
+            verticalLineTo(12f)
+            close()
+            moveTo(3.5f, 11f)
+            curveTo(3.5f, 10.6f, 3.9f, 10.2f, 4.3f, 10.2f)
+            horizontalLineTo(5f)
+            verticalLineTo(12f)
+            horizontalLineTo(4.3f)
+            curveTo(3.9f, 12f, 3.5f, 11.6f, 3.5f, 11f)
+            close()
+            moveTo(20.5f, 11f)
+            curveTo(20.5f, 11.6f, 20.1f, 12f, 19.7f, 12f)
+            horizontalLineTo(19f)
+            verticalLineTo(10.2f)
+            horizontalLineTo(19.7f)
+            curveTo(20.1f, 10.2f, 20.5f, 10.6f, 20.5f, 11f)
+            close()
+            moveTo(8.2f, 16.8f)
+            lineTo(6f, 19f)
+            lineTo(4.6f, 17.6f)
+            lineTo(6.8f, 15.4f)
+            close()
+            moveTo(15.8f, 16.8f)
+            lineTo(18f, 19f)
+            lineTo(19.4f, 17.6f)
+            lineTo(17.2f, 15.4f)
+            close()
+            moveTo(8.4f, 8.2f)
+            lineTo(6.2f, 6f)
+            lineTo(7.6f, 4.6f)
+            lineTo(9.8f, 6.8f)
+            close()
+            moveTo(15.6f, 8.2f)
+            lineTo(17.8f, 6f)
+            lineTo(19.2f, 7.4f)
+            lineTo(17f, 9.6f)
+            close()
+        }
+    }.build()
 
 fun androidKeyCodeToWindowsVk(keyCode: Int): Int {
     return when (keyCode) {

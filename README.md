@@ -1,6 +1,6 @@
 # AR3TE
 
-![AR3TE icon](./35314178-3b68-4a10-b81e-0e1348695d2b.png)
+<img src="./35314178-3b68-4a10-b81e-0e1348695d2b.png" alt="AR3TE icon" width="160">
 
 AR3TE is an Android remote display client for AR glasses and mobile devices. It discovers a Windows host on the local network, streams the PC display over WebSocket, and provides phone-based input controls for remote interaction.
 

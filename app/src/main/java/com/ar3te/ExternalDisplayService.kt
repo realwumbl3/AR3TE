@@ -184,7 +184,7 @@ class ExternalDisplayService : LifecycleService() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "External Display Service",
+                "AR3TE Display Service",
                 NotificationManager.IMPORTANCE_LOW
             )
             val manager = getSystemService(NotificationManager::class.java)
@@ -194,8 +194,8 @@ class ExternalDisplayService : LifecycleService() {
 
     private fun createNotification(): Notification {
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("External Display Active")
-            .setContentText("Manage your remote connection from the app")
+            .setContentTitle("AR3TE display active")
+            .setContentText("Manage the AR3TE connection from the app")
             .setSmallIcon(android.R.drawable.ic_menu_gallery)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()

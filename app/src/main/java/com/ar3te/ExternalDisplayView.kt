@@ -473,7 +473,7 @@ fun RemoteScreenView(
             if (videoConfig == null) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(
-                        text = machine?.name?.uppercase() ?: "REMOTE PC",
+                        text = machine?.name?.uppercase() ?: "AR3TE HOST",
                         color = Color.White,
                         style = MaterialTheme.typography.displayMedium
                     )
