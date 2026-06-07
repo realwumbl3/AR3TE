@@ -1,4 +1,4 @@
-package com.example.myapplication.discovery
+package com.ar3te.discovery
 
 data class DiscoveredMachine(
     val name: String,

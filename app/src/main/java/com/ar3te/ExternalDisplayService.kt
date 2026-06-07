@@ -1,4 +1,4 @@
-package com.example.myapplication
+package com.ar3te
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -15,7 +15,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import com.example.myapplication.discovery.DiscoveredMachine
+import com.ar3te.discovery.DiscoveredMachine
 
 class ExternalDisplayService : LifecycleService() {
 

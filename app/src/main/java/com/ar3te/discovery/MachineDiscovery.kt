@@ -1,4 +1,4 @@
-package com.example.myapplication.discovery
+package com.ar3te.discovery
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers

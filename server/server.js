@@ -8,7 +8,7 @@ const { WebSocketServer } = require("ws");
 
 const PORT = 45678;
 const WS_PORT = 45679;
-const DISCOVER_MSG = "RDESK_DISCOVER";
+const DISCOVER_MSG = "AR3TE_DISCOVER";
 
 function getPidsOnPort(port) {
   const pids = new Set();
@@ -132,7 +132,7 @@ socket.on("message", (message, remote) => {
   }
 
   const payload = JSON.stringify({
-    type: "rdesk",
+    type: "ar3te",
     name: machineName,
     host: localIp,
     port: PORT,
@@ -153,7 +153,7 @@ socket.on("error", (error) => {
 
 socket.on("listening", () => {
   socket.setBroadcast(true);
-  console.log("Remote desktop discovery server running");
+  console.log("AR3TE host server running");
   console.log(`  Machine: ${machineName}`);
   console.log(`  UDP Discovery: ${localIp}:${PORT}`);
   console.log(`  WebSocket Stream: ws://${localIp}:${WS_PORT}`);

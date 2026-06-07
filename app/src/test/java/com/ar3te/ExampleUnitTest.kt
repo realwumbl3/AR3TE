@@ -1,4 +1,4 @@
-package com.example.myapplication
+package com.ar3te
 
 import org.junit.Test
 

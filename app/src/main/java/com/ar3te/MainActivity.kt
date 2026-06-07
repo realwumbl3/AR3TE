@@ -1,4 +1,4 @@
-package com.example.myapplication
+package com.ar3te
 
 import android.annotation.SuppressLint
 import android.content.ComponentName
@@ -74,9 +74,9 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
-import com.example.myapplication.discovery.DiscoveredMachine
-import com.example.myapplication.discovery.MachineDiscovery
-import com.example.myapplication.ui.theme.MyApplicationTheme
+import com.ar3te.discovery.DiscoveredMachine
+import com.ar3te.discovery.MachineDiscovery
+import com.ar3te.ui.theme.AR3TETheme
 import kotlinx.coroutines.delay
 import org.json.JSONObject
 import java.util.Locale
@@ -144,7 +144,7 @@ class MainActivity : ComponentActivity() {
         handleUsbIntent(intent)
 
         setContent {
-            MyApplicationTheme {
+            AR3TETheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     val machine = activeMachine
                     if (machine == null) {

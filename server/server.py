@@ -4,7 +4,7 @@ import socket
 import platform
 
 PORT = 45678
-DISCOVER_MSG = b"RDESK_DISCOVER"
+DISCOVER_MSG = b"AR3TE_DISCOVER"
 
 
 def get_local_ipv4() -> str:
@@ -26,7 +26,7 @@ def main() -> None:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("", PORT))
 
-    print("Remote desktop discovery server running")
+    print("AR3TE host server running")
     print(f"  Machine: {machine_name}")
     print(f"  Address: {local_ip}:{PORT}")
     print("  Waiting for discovery requests on the local network...")
@@ -38,7 +38,7 @@ def main() -> None:
 
         payload = json.dumps(
             {
-                "type": "rdesk",
+                "type": "ar3te",
                 "name": machine_name,
                 "host": local_ip,
                 "port": PORT,

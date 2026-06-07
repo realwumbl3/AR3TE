@@ -1,4 +1,4 @@
-package com.example.myapplication
+package com.ar3te
 
 import android.app.Activity
 import android.app.PendingIntent
@@ -428,7 +428,7 @@ class RayNeoGlassesTracker private constructor(context: Context) {
 
     companion object {
         private const val TAG = "RayNeoTracker"
-        const val ACTION_USB_PERMISSION = "com.example.myapplication.USB_PERMISSION"
+        const val ACTION_USB_PERMISSION = "com.ar3te.USB_PERMISSION"
         private const val RAYNEO_VENDOR_ID = 0x3941
         private const val DEG2RAD = 0.017453292f
 

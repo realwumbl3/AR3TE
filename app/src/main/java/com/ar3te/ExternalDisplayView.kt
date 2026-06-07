@@ -1,4 +1,4 @@
-package com.example.myapplication
+package com.ar3te
 
 import android.app.Presentation
 import android.content.Context
@@ -37,7 +37,7 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
-import com.example.myapplication.discovery.DiscoveredMachine
+import com.ar3te.discovery.DiscoveredMachine
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color

@@ -1,30 +1,34 @@
-# r.3
+# AR3TE
 
-Remote desktop viewer for Android. Stream a Windows PC screen to your phone over the local network with automatic machine discovery.
+![AR3TE icon](./35314178-3b68-4a10-b81e-0e1348695d2b.png)
+
+AR3TE is an Android remote display client for AR glasses and mobile devices. It discovers a Windows host on the local network, streams the PC display over WebSocket, and provides phone-based input controls for remote interaction.
 
 ## Overview
 
-**r.3** pairs an Android client with a Windows host server:
+AR3TE pairs an Android client with a Windows host server:
 
-- **Android app** — discovers PCs on the LAN and displays the live remote screen over WebSocket
-- **Host server** (`server/`) — UDP discovery, screen capture, and WebSocket streaming
+- Android app: discovers AR3TE hosts on the LAN, displays the live remote screen, and provides virtual trackpad, keyboard, monitor switching, and RayNeo 3DOF controls.
+- Host server (`server/`): handles UDP discovery, screen capture, cursor/control messages, and WebSocket video streaming.
 
 ## Requirements
 
 ### Android client
 
 - Android Studio
-- Android device or emulator (API 24+)
+- Android device or emulator running API 24+
+- Optional RayNeo Air 3S Pro glasses for 3DOF view controls
 
 ### Windows host
 
-- Node.js 18+
-- .NET SDK (to build `Capture.exe` from `server/Capture.cs`)
 - Windows 10/11
+- Node.js 18+
+- .NET SDK to build `Capture.exe` from `server/Capture.cs`
+- FFmpeg available on `PATH` or through `FFMPEG_PATH`
 
-## Getting started
+## Getting Started
 
-### 1. Run the host server (Windows PC)
+### 1. Run the host server
 
 ```bash
 cd server
@@ -34,8 +38,8 @@ npm run dev
 
 The server listens on:
 
-| Service    | Port  |
-|------------|-------|
+| Service | Port |
+| --- | --- |
 | UDP discovery | 45678 |
 | WebSocket stream | 45679 |
 
@@ -47,27 +51,27 @@ dotnet build Capture.csproj -c Release
 
 ### 2. Run the Android app
 
-1. Open the project in Android Studio
-2. Build and run on a device connected to the same network as the PC
-3. Grant notification permission when prompted (used for the discovery service)
-4. Select a discovered machine to view its screen
+1. Open the project in Android Studio.
+2. Build and run AR3TE on a device connected to the same local network as the PC.
+3. Grant notification permission when prompted.
+4. Select a discovered machine to view its screen.
 
-## Project structure
+## Project Structure
 
+```text
+app/      Android client (Kotlin, Jetpack Compose)
+server/   Windows host
+  server.js      Discovery and WebSocket relay
+  Capture.cs     DXGI screen capture helper
+  package.json   Host server scripts and dependencies
 ```
-├── app/          Android client (Kotlin, Jetpack Compose)
-└── server/       Windows host
-    ├── server.js     Discovery + WebSocket relay
-    ├── Capture.cs    DXGI screen capture
-    └── package.json
-```
 
-## How it works
+## How It Works
 
-1. The Android app broadcasts `RDESK_DISCOVER` over UDP
-2. The host server responds with machine name, IP, and ports
-3. The app connects via WebSocket and receives JPEG frames from `Capture.exe`
-4. Monitor selection is sent back to the host as a JSON control message
+1. The Android app broadcasts `AR3TE_DISCOVER` over UDP.
+2. The host server responds with machine name, IP address, and stream ports.
+3. The app connects via WebSocket and receives video frames from the host capture pipeline.
+4. Monitor selection, cursor movement, keyboard input, and debug controls are sent back to the host as JSON control messages.
 
 ## License
 
