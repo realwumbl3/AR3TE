@@ -27,3 +27,4 @@ server/*.deps.json
 server/*.runtimeconfig.json
 server/*.bin
 server/*.err
+.gradle-home/
