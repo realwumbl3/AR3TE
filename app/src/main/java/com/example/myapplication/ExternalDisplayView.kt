@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.DisposableEffect
@@ -122,6 +123,18 @@ class ExternalDisplayPresentation(
     var monitorIndex by mutableIntStateOf(1)
     var onStatsUpdated: ((Int, Int, String?) -> Unit)? = null
     var onCaptureMethodUpdated: ((String) -> Unit)? = null
+    var onSendMessage: ((String) -> Unit)? = null
+    var onRemoteCursorReceived: ((Float, Float, Int, Int) -> Unit)? = null
+    
+    private var _localCursorX by mutableStateOf(0f)
+    var localCursorX: Float
+        get() = _localCursorX
+        set(value) { _localCursorX = value }
+
+    private var _localCursorY by mutableStateOf(0f)
+    var localCursorY: Float
+        get() = _localCursorY
+        set(value) { _localCursorY = value }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -133,7 +146,17 @@ class ExternalDisplayPresentation(
             setViewTreeSavedStateRegistryOwner(this@ExternalDisplayPresentation)
             setViewTreeViewModelStoreOwner(this@ExternalDisplayPresentation)
             setContent {
-                ExternalDisplayScreen(displayState, activeMachine, monitorIndex, onStatsUpdated, onCaptureMethodUpdated)
+                ExternalDisplayScreen(
+                    displayState, 
+                    activeMachine, 
+                    monitorIndex, 
+                    onStatsUpdated, 
+                    onCaptureMethodUpdated, 
+                    { onSendMessage = it },
+                    { x, y, w, h -> onRemoteCursorReceived?.invoke(x, y, w, h) },
+                    localCursorX,
+                    localCursorY
+                )
             }
         }
         
@@ -157,12 +180,25 @@ fun ExternalDisplayScreen(
     machine: DiscoveredMachine? = null,
     monitorIndex: Int = 1,
     onStatsUpdated: ((Int, Int, String?) -> Unit)? = null,
-    onCaptureMethodUpdated: ((String) -> Unit)? = null
+    onCaptureMethodUpdated: ((String) -> Unit)? = null,
+    onClientReady: ((String) -> Unit) -> Unit = {},
+    onRemoteCursorReceived: (Float, Float, Int, Int) -> Unit = { _, _, _, _ -> },
+    localCursorX: Float = 0f,
+    localCursorY: Float = 0f
 ) {
     when (state) {
         ExternalDisplayState.IDLE -> IdleScreen()
         ExternalDisplayState.REMOTE_SCREEN -> key(machine?.host, monitorIndex) {
-            RemoteScreenView(machine, monitorIndex, onStatsUpdated, onCaptureMethodUpdated)
+            RemoteScreenView(
+                machine, 
+                monitorIndex, 
+                onStatsUpdated, 
+                onCaptureMethodUpdated, 
+                onClientReady, 
+                onRemoteCursorReceived,
+                localCursorX,
+                localCursorY
+            )
         }
     }
 }
@@ -196,10 +232,24 @@ fun RemoteScreenView(
     machine: DiscoveredMachine?,
     monitorIndex: Int,
     onStatsUpdated: ((Int, Int, String?) -> Unit)? = null,
-    onCaptureMethodUpdated: ((String) -> Unit)? = null
+    onCaptureMethodUpdated: ((String) -> Unit)? = null,
+    onClientReady: ((String) -> Unit) -> Unit = {},
+    onRemoteCursorReceived: (Float, Float, Int, Int) -> Unit = { _, _, _, _ -> },
+    localCursorX: Float = 0f,
+    localCursorY: Float = 0f
 ) {
     val scope = rememberCoroutineScope()
     var client by remember(machine, monitorIndex) { mutableStateOf<WebSocketClient?>(null) }
+    
+    LaunchedEffect(client) {
+        onClientReady { msg ->
+            client?.let {
+                if (it.isOpen) {
+                    it.send(msg)
+                }
+            }
+        }
+    }
     var videoConfig by remember(machine, monitorIndex) { mutableStateOf<H264StreamConfig?>(null) }
     var captureMethod by remember(machine, monitorIndex) { mutableStateOf<String?>(null) }
     var cursor by remember(machine, monitorIndex) { mutableStateOf<RemoteCursorState?>(null) }
@@ -296,7 +346,11 @@ fun RemoteScreenView(
                                         hotY = if (json.has("hy")) json.optInt("hy") else (cursor?.hotY ?: 0)
                                     )
                                 } else {
-                                    null
+                                    // Even if invisible, keep the last known state but set visible=false
+                                    cursor?.copy(visible = false)
+                                }
+                                nextCursor?.let {
+                                    onRemoteCursorReceived(it.x, it.y, it.sourceWidth, it.sourceHeight)
                                 }
                                 scope.launch(Dispatchers.Main) {
                                     cursor = nextCursor
@@ -414,7 +468,7 @@ fun RemoteScreenView(
                         },
                         modifier = Modifier.fillMaxSize()
                     )
-                    CursorOverlay(cursor, viewSize)
+                    CursorOverlay(cursor, viewSize, localCursorX, localCursorY)
                 }
             }
         }
@@ -422,10 +476,15 @@ fun RemoteScreenView(
 }
 
 @Composable
-private fun CursorOverlay(cursor: RemoteCursorState?, viewSize: IntSize) {
+private fun CursorOverlay(cursor: RemoteCursorState?, viewSize: IntSize, localX: Float, localY: Float) {
     val cursorBitmap = cursor?.bitmap
-    if (cursor == null || !cursor.visible || cursorBitmap == null || viewSize.width <= 0 || viewSize.height <= 0) {
+    if (cursorBitmap == null || viewSize.width <= 0 || viewSize.height <= 0) {
         return
+    }
+    // Host visibility flag logic
+    if (!cursor.visible) {
+        // We could hide the local cursor here, but keeping it visible makes it easier 
+        // for the user to find their place after the host hides it.
     }
     val density = LocalDensity.current
 
@@ -436,8 +495,8 @@ private fun CursorOverlay(cursor: RemoteCursorState?, viewSize: IntSize) {
     val drawnHeight = sourceHeight * scale
     val offsetX = (viewSize.width - drawnWidth) / 2f
     val offsetY = (viewSize.height - drawnHeight) / 2f
-    val cursorLeft = offsetX + (cursor.x - cursor.hotX) * scale
-    val cursorTop = offsetY + (cursor.y - cursor.hotY) * scale
+    val cursorLeft = offsetX + (localX - cursor.hotX) * scale
+    val cursorTop = offsetY + (localY - cursor.hotY) * scale
     val cursorWidth = (cursorBitmap.width * scale).coerceAtLeast(1f)
     val cursorHeight = (cursorBitmap.height * scale).coerceAtLeast(1f)
 

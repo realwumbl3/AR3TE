@@ -181,6 +181,7 @@ const captureEncoders = ["h264_nvenc"];
 let captureProcess = null;
 let rawCaptureProcess = null;
 let cursorCaptureProcess = null;
+let inputProcess = null;
 let shuttingDown = false;
 let activeMonitorIndex = 0;
 let activeMonitorInfo = null;
@@ -935,6 +936,42 @@ if (!ffmpegPath) {
 
 startCaptureProcess();
 
+function startInputProcess() {
+  if (shuttingDown) return;
+  const captureExe = path.join(__dirname, "Capture.exe");
+  if (!fs.existsSync(captureExe)) {
+    console.error(`Input handler error: ${captureExe} not found. Please build Capture.exe`);
+    return;
+  }
+  console.log("Starting input handler process");
+  try {
+    inputProcess = spawn(captureExe, ["--input"], { stdio: ["pipe", "ignore", "pipe"] });
+    inputProcess.on("error", (err) => {
+      console.error("Failed to start input process:", err);
+    });
+    inputProcess.stderr.on("data", (data) => {
+      process.stderr.write(`[input] ${data}`);
+    });
+    inputProcess.on("exit", (code) => {
+      if (!shuttingDown) {
+        console.log(`Input handler exited (code ${code}), restarting...`);
+        setTimeout(startInputProcess, 2000);
+      }
+    });
+  } catch (err) {
+    console.error("Error spawning input process:", err);
+  }
+}
+
+function stopInputProcess() {
+  if (inputProcess && !inputProcess.killed) {
+    inputProcess.kill();
+  }
+  inputProcess = null;
+}
+
+startInputProcess();
+
 // --- WebSocket Server ---
 const server = http.createServer();
 wss = new WebSocketServer({ server });
@@ -973,6 +1010,29 @@ wss.on("connection", (ws) => {
           }
           console.log(`Switched to monitor ${data.value}`);
         }
+      } else if (data.type === "mouse_move") {
+        if (inputProcess && !inputProcess.killed) {
+          inputProcess.stdin.write(`mr ${Math.round(data.dx)} ${Math.round(data.dy)}\n`);
+        }
+      } else if (data.type === "mouse_move_abs") {
+        if (inputProcess && !inputProcess.killed) {
+          const monitor = activeMonitorInfo || { x: 0, y: 0 };
+          const absX = Math.round(data.x) + monitor.x;
+          const absY = Math.round(data.y) + monitor.y;
+          inputProcess.stdin.write(`mm ${absX} ${absY}\n`);
+        }
+      } else if (data.type === "mouse_down") {
+        inputProcess?.stdin.write(`md ${data.button}\n`);
+      } else if (data.type === "mouse_up") {
+        inputProcess?.stdin.write(`mu ${data.button}\n`);
+      } else if (data.type === "mouse_wheel") {
+        inputProcess?.stdin.write(`mw ${Math.round(data.delta)}\n`);
+      } else if (data.type === "key_down") {
+        if (data.shift) inputProcess?.stdin.write(`kd 16\n`);
+        inputProcess?.stdin.write(`kd ${data.vk}\n`);
+      } else if (data.type === "key_up") {
+        inputProcess?.stdin.write(`ku ${data.vk}\n`);
+        if (data.shift) inputProcess?.stdin.write(`ku 16\n`);
       }
     } catch (e) {}
   });
@@ -987,6 +1047,7 @@ server.listen(WS_PORT);
 function shutdown() {
   shuttingDown = true;
   stopCaptureProcess();
+  stopInputProcess();
   process.exit(0);
 }
 

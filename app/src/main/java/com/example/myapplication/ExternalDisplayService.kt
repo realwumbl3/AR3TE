@@ -67,6 +67,43 @@ class ExternalDisplayService : LifecycleService() {
             _currentCaptureMethod = value
         }
 
+    var localCursorX by mutableStateOf(0f)
+    var localCursorY by mutableStateOf(0f)
+    var lastLocalMoveTime by mutableStateOf(0L)
+    var remoteWidth by mutableIntStateOf(1920)
+    var remoteHeight by mutableIntStateOf(1080)
+
+    fun updateLocalCursor(dx: Float, dy: Float) {
+        localCursorX = (localCursorX + dx).coerceIn(0f, remoteWidth.toFloat())
+        localCursorY = (localCursorY + dy).coerceIn(0f, remoteHeight.toFloat())
+        lastLocalMoveTime = System.currentTimeMillis()
+        
+        presentation?.localCursorX = localCursorX
+        presentation?.localCursorY = localCursorY
+        
+        sendRemoteMessage(org.json.JSONObject().apply {
+            put("type", "mouse_move_abs")
+            put("x", localCursorX.toInt())
+            put("y", localCursorY.toInt())
+        }.toString())
+    }
+
+    fun syncLocalCursorFromRemote(x: Float, y: Float, w: Int, h: Int) {
+        val now = System.currentTimeMillis()
+        remoteWidth = w
+        remoteHeight = h
+        if (now - lastLocalMoveTime > 2000) {
+            localCursorX = x
+            localCursorY = y
+            presentation?.localCursorX = x
+            presentation?.localCursorY = y
+        }
+    }
+
+    fun sendRemoteMessage(message: String) {
+        presentation?.onSendMessage?.invoke(message)
+    }
+
     private val displayListener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) { updatePresentation() }
         override fun onDisplayRemoved(displayId: Int) { updatePresentation() }
@@ -110,6 +147,8 @@ class ExternalDisplayService : LifecycleService() {
                     displayState = _currentState
                     activeMachine = _activeMachine
                     monitorIndex = _monitorIndex
+                    localCursorX = this@ExternalDisplayService.localCursorX
+                    localCursorY = this@ExternalDisplayService.localCursorY
                     onStatsUpdated = { f, k, method ->
                         currentFps = f
                         currentKbps = k
@@ -119,6 +158,9 @@ class ExternalDisplayService : LifecycleService() {
                     }
                     onCaptureMethodUpdated = { method ->
                         currentCaptureMethod = method
+                    }
+                    onRemoteCursorReceived = { x, y, w, h ->
+                        syncLocalCursorFromRemote(x, y, w, h)
                     }
                     show()
                 }
