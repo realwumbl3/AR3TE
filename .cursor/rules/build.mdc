@@ -1,0 +1,35 @@
+---
+description: How to build this Android app
+alwaysApply: true
+---
+
+# Building This App
+
+Android app (Kotlin + Jetpack Compose), built with Gradle. minSdk 24, targetSdk 36.
+
+## JDK
+
+`java` is NOT on PATH. Use the JDK bundled with Android Studio by setting `JAVA_HOME`
+for the command (PowerShell):
+
+```powershell
+$env:JAVA_HOME="C:\Program Files\Android\Android Studio\jbr"
+```
+
+## Common commands
+
+Run from the repo root via the Gradle wrapper (`gradlew.bat` on Windows):
+
+```powershell
+# Fast type-check after Kotlin edits (preferred verification step)
+.\gradlew.bat :app:compileDebugKotlin --console=plain
+
+# Build a debug APK
+.\gradlew.bat :app:assembleDebug --console=plain
+
+# Install onto a connected device/glasses
+.\gradlew.bat :app:installDebug --console=plain
+```
+
+After editing Kotlin, verify with `:app:compileDebugKotlin` — it's the quickest way to
+catch errors without a full APK build.

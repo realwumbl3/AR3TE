@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
@@ -14,11 +15,15 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.PointerIcon
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.ui.input.pointer.changedToUp
+import kotlin.math.abs
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -26,6 +31,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -34,9 +40,9 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -55,8 +61,10 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextRange
@@ -69,6 +77,7 @@ import androidx.lifecycle.lifecycleScope
 import com.example.myapplication.discovery.DiscoveredMachine
 import com.example.myapplication.discovery.MachineDiscovery
 import com.example.myapplication.ui.theme.MyApplicationTheme
+import kotlinx.coroutines.delay
 import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
@@ -78,6 +87,7 @@ class MainActivity : ComponentActivity() {
     private var discoveredMachines by mutableStateOf<List<DiscoveredMachine>>(emptyList())
     private var activeMachine by mutableStateOf<DiscoveredMachine?>(null)
     private var isPointerCaptured by mutableStateOf(false)
+    private var is3DofEnabled by mutableStateOf(false)
 
     private lateinit var machineDiscovery: MachineDiscovery
 
@@ -130,6 +140,8 @@ class MainActivity : ComponentActivity() {
         startService(intent)
         bindService(intent, connection, BIND_AUTO_CREATE)
 
+        handleUsbIntent(intent)
+
         setContent {
             MyApplicationTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
@@ -142,7 +154,7 @@ class MainActivity : ComponentActivity() {
                                 externalDisplayService?.activeMachine = it
                                 externalDisplayService?.currentState = ExternalDisplayState.REMOTE_SCREEN
                             },
-                            modifier = Modifier.padding(innerPadding)
+                            modifier = Modifier.padding(innerPadding).imePadding()
                         )
                     } else {
                         ScreenSharingScreen(
@@ -151,6 +163,7 @@ class MainActivity : ComponentActivity() {
                             currentKbps = externalDisplayService?.currentKbps ?: 0,
                             currentCaptureMethod = externalDisplayService?.currentCaptureMethod ?: "Loading...",
                             isPointerCaptured = isPointerCaptured,
+                            is3DofEnabled = is3DofEnabled,
                             onStop = { 
                                 activeMachine = null
                                 externalDisplayService?.activeMachine = null
@@ -181,7 +194,20 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                             },
-                            modifier = Modifier.padding(innerPadding)
+                            on3DofToggle = { enabled ->
+                                is3DofEnabled = enabled
+                                externalDisplayService?.is3DofEnabled = enabled
+                                val tracker = RayNeoGlassesTracker.getInstance(this)
+                                if (enabled) {
+                                    // USB permission dialog only appears on the phone Activity.
+                                    tracker.ensureUsbAccess(this) { _ ->
+                                        tracker.start()
+                                    }
+                                } else {
+                                    tracker.stop()
+                                }
+                            },
+                            modifier = Modifier.padding(innerPadding).imePadding()
                         )
                     }
                 }
@@ -189,8 +215,23 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleUsbIntent(intent)
+    }
+
+    private fun handleUsbIntent(intent: Intent?) {
+        if (intent?.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) return
+        Log.d("MainActivity", "USB device attached")
+        if (is3DofEnabled) {
+            val tracker = RayNeoGlassesTracker.getInstance(this)
+            tracker.ensureUsbAccess(this) { tracker.start() }
+        }
+    }
+
     override fun onDestroy() {
         machineDiscovery.stop()
+        RayNeoGlassesTracker.getInstance(this).stop()
         super.onDestroy()
         if (isBound) {
             unbindService(connection)
@@ -379,21 +420,27 @@ fun ScreenSharingScreen(
     currentKbps: Int,
     currentCaptureMethod: String,
     isPointerCaptured: Boolean,
+    is3DofEnabled: Boolean,
     onStop: () -> Unit,
     onMonitorSwitch: (Int) -> Unit,
     onSendMessage: (String) -> Unit,
     onMoveCursor: (Float, Float) -> Unit,
     onCapturedMouseEvent: (MotionEvent) -> Boolean,
     onCaptureToggle: (Boolean) -> Unit,
+    on3DofToggle: (Boolean) -> Unit,
     modifier: Modifier = Modifier
 ) {
     var monitorIndex by remember { mutableIntStateOf(1) }
+    var showDebugMenu by remember { mutableStateOf(false) }
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusRequester = remember { FocusRequester() }
     var keyboardText by remember { mutableStateOf(TextFieldValue(" ", selection = TextRange(1))) }
     val view = LocalView.current
     val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
     val currentCapturedMouseEvent by rememberUpdatedState(onCapturedMouseEvent)
+
+    BackHandler(onBack = onStop)
 
     LaunchedEffect(isPointerCaptured) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -470,6 +517,35 @@ fun ScreenSharingScreen(
                 onCaptureToggle(!isPointerCaptured)
             }) {
                 Text(if (isPointerCaptured) "Unlock" else "Lock")
+            }
+            Spacer(modifier = Modifier.width(4.dp))
+            Button(onClick = { showDebugMenu = !showDebugMenu }) {
+                Text("Debug")
+            }
+        }
+
+        if (showDebugMenu) {
+            Card(
+                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant
+                )
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text("Debug Menu", style = MaterialTheme.typography.titleMedium)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(
+                            checked = is3DofEnabled,
+                            onCheckedChange = { on3DofToggle(it) }
+                        )
+                        Text("Enable 3DOF View (Rayneo Air 3S Pro)")
+                    }
+                    if (is3DofEnabled) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        ThreeDofPhoneStatus()
+                    }
+                }
             }
         }
 
@@ -549,27 +625,97 @@ fun ScreenSharingScreen(
                 .fillMaxWidth()
                 .weight(1f)
                 .pointerInput(Unit) {
-                    detectDragGestures(
-                        onDrag = { change, dragAmount ->
-                            change.consume()
-                            val sensitivity = 2.0f
-                            try {
-                                onMoveCursor(dragAmount.x * sensitivity, dragAmount.y * sensitivity)
-                            } catch (e: Exception) {
-                                Log.e("RemoteInput", "Trackpad error", e)
+                    awaitEachGesture {
+                        awaitFirstDown()
+                        var isTwoFinger = false
+                        var isDragging = false
+                        var longPressTriggered = false
+                        var lastTwoFingerY = 0f
+                        var totalMoveDist = 0f
+                        val startTime = System.currentTimeMillis()
+
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val changes = event.changes
+                            val currentTime = System.currentTimeMillis()
+
+                            if (changes.size >= 2) {
+                                isTwoFinger = true
+                                val avgY = changes.map { it.position.y }.average().toFloat()
+                                if (lastTwoFingerY != 0f) {
+                                    val deltaY = avgY - lastTwoFingerY
+                                    if (abs(deltaY) > 1f) {
+                                        onSendMessage(JSONObject().apply {
+                                            put("type", "mouse_wheel")
+                                            put("delta", -deltaY * 5f)
+                                        }.toString())
+                                        isDragging = true
+                                    }
+                                }
+                                lastTwoFingerY = avgY
+                            } else if (changes.size == 1 && !isTwoFinger) {
+                                val change = changes[0]
+                                if (change.pressed) {
+                                    val dragAmount = change.position - change.previousPosition
+                                    totalMoveDist += dragAmount.getDistance()
+                                    
+                                    if (dragAmount.getDistance() > 0.5f) {
+                                        onMoveCursor(dragAmount.x * 2f, dragAmount.y * 2f)
+                                        if (totalMoveDist > 10f) {
+                                            isDragging = true
+                                        }
+                                    }
+
+                                    if (!longPressTriggered && !isDragging && 
+                                        currentTime - startTime > 350) {
+                                        longPressTriggered = true
+                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        onSendMessage(JSONObject().apply {
+                                            put("type", "mouse_down")
+                                            put("button", "l")
+                                        }.toString())
+                                    }
+                                }
                             }
+
+                            if (changes.all { it.changedToUp() }) {
+                                if (!isDragging && !longPressTriggered) {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    if (isTwoFinger) {
+                                        // Two-finger tap -> Right Click
+                                        onSendMessage(JSONObject().apply {
+                                            put("type", "mouse_down")
+                                            put("button", "r")
+                                        }.toString())
+                                        onSendMessage(JSONObject().apply {
+                                            put("type", "mouse_up")
+                                            put("button", "r")
+                                        }.toString())
+                                    } else {
+                                        // Single-finger tap -> Left Click
+                                        onSendMessage(JSONObject().apply {
+                                            put("type", "mouse_down")
+                                            put("button", "l")
+                                        }.toString())
+                                        onSendMessage(JSONObject().apply {
+                                            put("type", "mouse_up")
+                                            put("button", "l")
+                                        }.toString())
+                                    }
+                                }
+                                
+                                if (longPressTriggered) {
+                                    onSendMessage(JSONObject().apply {
+                                        put("type", "mouse_up")
+                                        put("button", "l")
+                                    }.toString())
+                                }
+                                break
+                            }
+                            
+                            changes.forEach { it.consume() }
                         }
-                    )
-                }
-                .clickable {
-                    onSendMessage(JSONObject().apply {
-                        put("type", "mouse_down")
-                        put("button", "l")
-                    }.toString())
-                    onSendMessage(JSONObject().apply {
-                        put("type", "mouse_up")
-                        put("button", "l")
-                    }.toString())
+                    }
                 },
             colors = CardDefaults.cardColors(
                 containerColor = Color.Black.copy(alpha = 0.8f)
@@ -589,44 +735,14 @@ fun ScreenSharingScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        Row(modifier = Modifier.fillMaxWidth()) {
-            Button(
-                onClick = { 
-                    onSendMessage(JSONObject().apply {
-                        put("type", "mouse_down")
-                        put("button", "r")
-                    }.toString())
-                    onSendMessage(JSONObject().apply {
-                        put("type", "mouse_up")
-                        put("button", "r")
-                    }.toString())
-                },
-                modifier = Modifier.weight(1f)
-            ) {
-                Text("Right Click")
-            }
-            Spacer(modifier = Modifier.width(8.dp))
-            Button(
-                onClick = { 
-                    monitorIndex = if (monitorIndex == 1) 2 else 1
-                    onMonitorSwitch(monitorIndex)
-                },
-                modifier = Modifier.weight(1f)
-            ) {
-                Text("Switch Mon")
-            }
-        }
-
-        Spacer(modifier = Modifier.height(8.dp))
-
         Button(
-            onClick = onStop,
-            modifier = Modifier.fillMaxWidth(),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = MaterialTheme.colorScheme.error
-            )
+            onClick = { 
+                monitorIndex = if (monitorIndex == 1) 2 else 1
+                onMonitorSwitch(monitorIndex)
+            },
+            modifier = Modifier.fillMaxWidth()
         ) {
-            Text("Stop Sharing")
+            Text("Switch Monitor")
         }
     }
 }
@@ -747,4 +863,58 @@ fun charToVk(char: Char): Int {
         '`', '~' -> 0xC0
         else -> 0
     }
+}
+
+@Composable
+private fun ThreeDofPhoneStatus() {
+    val context = LocalContext.current
+    val tracker = remember { RayNeoGlassesTracker.getInstance(context) }
+    var status by remember { mutableStateOf(tracker.status) }
+    var usbSummary by remember { mutableStateOf(tracker.usbDeviceSummary()) }
+    var vizObject by remember { mutableStateOf(tracker.vizObject) }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            status = tracker.status
+            usbSummary = tracker.usbDeviceSummary()
+            vizObject = tracker.vizObject
+            delay(500)
+        }
+    }
+
+    Text(
+        text = "3DOF: $status",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.primary
+    )
+    Text(
+        text = usbSummary,
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+    Spacer(modifier = Modifier.height(8.dp))
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Button(onClick = { tracker.reset() }) {
+            Text("Reset orientation")
+        }
+        Spacer(modifier = Modifier.width(8.dp))
+        Button(onClick = { vizObject = tracker.cycleVizObject() }) {
+            Text(
+                when (vizObject) {
+                    RayNeoGlassesTracker.VizObject.AXIS -> "Viz: Axis"
+                    RayNeoGlassesTracker.VizObject.GLASSES -> "Viz: Glasses"
+                }
+            )
+        }
+    }
+    Text(
+        text = "Reset re-zeros HUD. Hold still ~2s on connect for gyro bias calibration.",
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
+    Text(
+        text = "USB permission appears on this phone screen, not the glasses.",
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant
+    )
 }

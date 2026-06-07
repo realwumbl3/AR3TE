@@ -46,6 +46,14 @@ class ExternalDisplayService : LifecycleService() {
             presentation?.monitorIndex = value
         }
 
+    private var _is3DofEnabled by mutableStateOf(false)
+    var is3DofEnabled: Boolean
+        get() = _is3DofEnabled
+        set(value) {
+            _is3DofEnabled = value
+            presentation?.is3DofEnabled = value
+        }
+
     private var _currentFps by mutableIntStateOf(0)
     var currentFps: Int
         get() = _currentFps
@@ -147,6 +155,7 @@ class ExternalDisplayService : LifecycleService() {
                     displayState = _currentState
                     activeMachine = _activeMachine
                     monitorIndex = _monitorIndex
+                    is3DofEnabled = _is3DofEnabled
                     localCursorX = this@ExternalDisplayService.localCursorX
                     localCursorY = this@ExternalDisplayService.localCursorY
                     onStatsUpdated = { f, k, method ->

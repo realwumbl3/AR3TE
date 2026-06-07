@@ -13,9 +13,12 @@ import android.util.Base64
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -36,12 +39,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import com.example.myapplication.discovery.DiscoveredMachine
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.viewinterop.AndroidView
@@ -56,11 +62,13 @@ import kotlinx.coroutines.withContext
 import androidx.compose.runtime.rememberCoroutineScope
 import org.java_websocket.client.WebSocketClient
 import org.java_websocket.handshake.ServerHandshake
-import org.json.JSONObject
 import java.net.URI
 import java.nio.ByteBuffer
 import java.util.ArrayDeque
+import java.util.Locale
 import kotlin.math.roundToInt
+import org.json.JSONArray
+import org.json.JSONObject
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
 import androidx.lifecycle.ViewModelStore
@@ -105,6 +113,28 @@ data class RemoteCursorState(
     val hotY: Int = 0
 )
 
+private const val GLASSES_MODEL_ASSET = "models/polygonal_ar_glasses.json"
+
+private data class GlassesWireframeModel(
+    val scale: Float,
+    val perspective: Float,
+    val parts: List<GlassesWireframePart>
+)
+
+private data class GlassesWireframePart(
+    val name: String,
+    val color: String,
+    val strokeWidth: Float,
+    val closed: Boolean,
+    val points: List<WirePoint3D>
+)
+
+private data class WirePoint3D(
+    val x: Float,
+    val y: Float,
+    val z: Float
+)
+
 class ExternalDisplayPresentation(
     outerContext: Context,
     display: Display
@@ -121,6 +151,7 @@ class ExternalDisplayPresentation(
     var displayState by mutableStateOf(ExternalDisplayState.IDLE)
     var activeMachine by mutableStateOf<DiscoveredMachine?>(null)
     var monitorIndex by mutableIntStateOf(1)
+    var is3DofEnabled by mutableStateOf(false)
     var onStatsUpdated: ((Int, Int, String?) -> Unit)? = null
     var onCaptureMethodUpdated: ((String) -> Unit)? = null
     var onSendMessage: ((String) -> Unit)? = null
@@ -150,6 +181,7 @@ class ExternalDisplayPresentation(
                     displayState, 
                     activeMachine, 
                     monitorIndex, 
+                    is3DofEnabled,
                     onStatsUpdated, 
                     onCaptureMethodUpdated, 
                     { onSendMessage = it },
@@ -179,6 +211,7 @@ fun ExternalDisplayScreen(
     state: ExternalDisplayState,
     machine: DiscoveredMachine? = null,
     monitorIndex: Int = 1,
+    is3DofEnabled: Boolean = false,
     onStatsUpdated: ((Int, Int, String?) -> Unit)? = null,
     onCaptureMethodUpdated: ((String) -> Unit)? = null,
     onClientReady: ((String) -> Unit) -> Unit = {},
@@ -192,6 +225,7 @@ fun ExternalDisplayScreen(
             RemoteScreenView(
                 machine, 
                 monitorIndex, 
+                is3DofEnabled,
                 onStatsUpdated, 
                 onCaptureMethodUpdated, 
                 onClientReady, 
@@ -231,6 +265,7 @@ fun IdleScreen() {
 fun RemoteScreenView(
     machine: DiscoveredMachine?,
     monitorIndex: Int,
+    is3DofEnabled: Boolean,
     onStatsUpdated: ((Int, Int, String?) -> Unit)? = null,
     onCaptureMethodUpdated: ((String) -> Unit)? = null,
     onClientReady: ((String) -> Unit) -> Unit = {},
@@ -469,10 +504,352 @@ fun RemoteScreenView(
                         modifier = Modifier.fillMaxSize()
                     )
                     CursorOverlay(cursor, viewSize, localCursorX, localCursorY)
+                    
+                    if (is3DofEnabled) {
+                        ThreeDofVisualizer()
+                    }
                 }
             }
         }
     }
+}
+
+@Composable
+fun ThreeDofVisualizer() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val tracker = remember { RayNeoGlassesTracker.getInstance(context) }
+    val glassesModel = remember(context) {
+        runCatching { loadGlassesWireframeModel(context) }
+            .getOrElse { defaultGlassesWireframeModel() }
+    }
+    var yawDeg by remember { mutableStateOf(0f) }
+    var pitchDeg by remember { mutableStateOf(0f) }
+    var rollDeg by remember { mutableStateOf(0f) }
+    var quat by remember { mutableStateOf(floatArrayOf(1f, 0f, 0f, 0f)) }
+    var vizObject by remember { mutableStateOf(RayNeoGlassesTracker.VizObject.AXIS) }
+    var sensorName by remember { mutableStateOf("Detecting...") }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            androidx.compose.runtime.withFrameNanos { }
+            val e = tracker.eulerDeg
+            yawDeg = e[0]
+            pitchDeg = e[1]
+            rollDeg = e[2]
+            quat = tracker.displayQuat.copyOf()
+            vizObject = tracker.vizObject
+            sensorName = tracker.status
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.35f)),
+        contentAlignment = Alignment.Center
+    ) {
+        when (vizObject) {
+            RayNeoGlassesTracker.VizObject.AXIS -> Axis3DGizmo(
+                quat = quat,
+                modifier = Modifier
+                    .fillMaxSize(0.92f)
+                    .padding(16.dp)
+            )
+            RayNeoGlassesTracker.VizObject.GLASSES -> Glasses3DGizmo(
+                quat = quat,
+                model = glassesModel,
+                modifier = Modifier
+                    .fillMaxSize(0.92f)
+                    .padding(16.dp)
+            )
+        }
+
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                sensorName.uppercase(),
+                color = Color.White,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.Bold
+            )
+            Text(
+                "Y ${String.format(Locale.US, "%.1f", yawDeg)}°  " +
+                    "P ${String.format(Locale.US, "%.1f", pitchDeg)}°  " +
+                    "R ${String.format(Locale.US, "%.1f", rollDeg)}°",
+                color = Color.Yellow,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Medium
+            )
+            Text(
+                "X→right  Y→up  Z→forward (nose)",
+                color = Color.White.copy(alpha = 0.75f),
+                style = MaterialTheme.typography.labelSmall
+            )
+        }
+    }
+}
+
+@Composable
+private fun Axis3DGizmo(
+    quat: FloatArray,
+    modifier: Modifier = Modifier
+) {
+    val axisX = Color(0xFFEF5350)
+    val axisY = Color(0xFF66BB6A)
+    val axisZ = Color(0xFF42A5F5)
+
+    Canvas(modifier = modifier) {
+        val cx = size.width / 2f
+        val cy = size.height / 2f
+        val arm = size.minDimension * 0.44f
+        val strokeWidth = size.minDimension * 0.028f
+
+        fun tip(x: Float, y: Float, z: Float): Offset {
+            val r = RayNeoGlassesTracker.rotateVectorByQuat(x, y, z, quat)
+            return Offset(cx + r[0], cy - r[1])
+        }
+
+        val origin = Offset(cx, cy)
+        val xTip = tip(arm, 0f, 0f)
+        val yTip = tip(0f, arm, 0f)
+        val zTip = tip(0f, 0f, arm)
+
+        drawLine(axisX, origin, xTip, strokeWidth, StrokeCap.Round)
+        drawLine(axisY, origin, yTip, strokeWidth, StrokeCap.Round)
+        drawLine(axisZ, origin, zTip, strokeWidth, StrokeCap.Round)
+
+        val dotR = strokeWidth * 0.85f
+        drawCircle(Color.White, dotR, origin)
+        drawCircle(axisX, dotR * 0.7f, xTip)
+        drawCircle(axisY, dotR * 0.7f, yTip)
+        drawCircle(axisZ, dotR * 0.7f, zTip)
+    }
+}
+
+@Composable
+private fun Glasses3DGizmo(
+    quat: FloatArray,
+    model: GlassesWireframeModel,
+    modifier: Modifier = Modifier
+) {
+    Canvas(modifier = modifier) {
+        val cx = size.width / 2f
+        val cy = size.height / 2f
+        val scale = size.minDimension * model.scale
+        val perspective = size.minDimension * model.perspective
+
+        fun project(p: WirePoint3D): Offset {
+            val rotated = RayNeoGlassesTracker.rotateVectorByQuat(p.x, p.y, p.z, quat)
+            val depth = (perspective - rotated[2] * scale * 0.15f).coerceAtLeast(scale * 0.55f)
+            val factor = perspective / depth
+            return Offset(
+                cx + rotated[0] * scale * factor,
+                cy - rotated[1] * scale * factor
+            )
+        }
+
+        fun drawLoop(points: List<WirePoint3D>, color: Color, strokeWidth: Float, closed: Boolean) {
+            if (points.size < 2) return
+            val stop = if (closed) points.size else points.size - 1
+            for (i in 0 until stop) {
+                val a = project(points[i])
+                val b = project(points[(i + 1) % points.size])
+                drawLine(color, a, b, strokeWidth, StrokeCap.Round)
+            }
+        }
+
+        fun partColor(name: String): Color {
+            return when (name) {
+                "frame" -> Color(0xFFF5F7FA)
+                "accent" -> Color(0xFF8EE6FF)
+                "lens" -> Color(0xFF4FC3F7)
+                else -> Color.White
+            }
+        }
+
+        model.parts.forEach { part ->
+            drawLoop(part.points, partColor(part.color), size.minDimension * part.strokeWidth, part.closed)
+        }
+
+        drawCircle(Color.White.copy(alpha = 0.10f), size.minDimension * 0.12f, Offset(cx, cy))
+    }
+}
+
+private fun loadGlassesWireframeModel(context: Context): GlassesWireframeModel {
+    val raw = context.assets.open(GLASSES_MODEL_ASSET).bufferedReader().use { it.readText() }
+    val json = JSONObject(raw)
+    val partsJson = json.getJSONArray("parts")
+
+    val parts = buildList {
+        for (i in 0 until partsJson.length()) {
+            val partJson = partsJson.getJSONObject(i)
+            val pointsJson = partJson.getJSONArray("points")
+            val points = buildList {
+                for (j in 0 until pointsJson.length()) {
+                    val p = pointsJson.getJSONArray(j)
+                    add(
+                        WirePoint3D(
+                            x = p.getDouble(0).toFloat(),
+                            y = p.getDouble(1).toFloat(),
+                            z = p.getDouble(2).toFloat()
+                        )
+                    )
+                }
+            }
+            add(
+                GlassesWireframePart(
+                    name = partJson.optString("name", "part_$i"),
+                    color = partJson.optString("color", "frame"),
+                    strokeWidth = partJson.optDouble("stroke", 0.02).toFloat(),
+                    closed = partJson.optBoolean("closed", false),
+                    points = points
+                )
+            )
+        }
+    }
+
+    return GlassesWireframeModel(
+        scale = json.optDouble("scale", 0.16).toFloat(),
+        perspective = json.optDouble("perspective", 2.8).toFloat(),
+        parts = parts
+    )
+}
+
+private fun defaultGlassesWireframeModel(): GlassesWireframeModel {
+    return GlassesWireframeModel(
+        scale = 0.16f,
+        perspective = 2.8f,
+        parts = listOf(
+            GlassesWireframePart(
+                name = "frame_left",
+                color = "frame",
+                strokeWidth = 0.021f,
+                closed = true,
+                points = listOf(
+                    WirePoint3D(-2.45f, 0.88f, 0.12f),
+                    WirePoint3D(-2.85f, 0.42f, 0.18f),
+                    WirePoint3D(-2.95f, 0.02f, 0.20f),
+                    WirePoint3D(-2.85f, -0.44f, 0.18f),
+                    WirePoint3D(-2.45f, -0.90f, 0.12f),
+                    WirePoint3D(-1.75f, -0.80f, -0.04f),
+                    WirePoint3D(-1.44f, -0.42f, -0.10f),
+                    WirePoint3D(-1.38f, 0.00f, -0.12f),
+                    WirePoint3D(-1.44f, 0.42f, -0.10f),
+                    WirePoint3D(-1.75f, 0.80f, -0.04f)
+                )
+            ),
+            GlassesWireframePart(
+                name = "frame_right",
+                color = "frame",
+                strokeWidth = 0.021f,
+                closed = true,
+                points = listOf(
+                    WirePoint3D(2.45f, 0.88f, 0.12f),
+                    WirePoint3D(2.85f, 0.42f, 0.18f),
+                    WirePoint3D(2.95f, 0.02f, 0.20f),
+                    WirePoint3D(2.85f, -0.44f, 0.18f),
+                    WirePoint3D(2.45f, -0.90f, 0.12f),
+                    WirePoint3D(1.75f, -0.80f, -0.04f),
+                    WirePoint3D(1.44f, -0.42f, -0.10f),
+                    WirePoint3D(1.38f, 0.00f, -0.12f),
+                    WirePoint3D(1.44f, 0.42f, -0.10f),
+                    WirePoint3D(1.75f, 0.80f, -0.04f)
+                )
+            ),
+            GlassesWireframePart(
+                name = "bridge_main",
+                color = "frame",
+                strokeWidth = 0.018f,
+                closed = false,
+                points = listOf(
+                    WirePoint3D(-1.38f, 0.00f, -0.12f),
+                    WirePoint3D(-0.86f, 0.06f, -0.10f),
+                    WirePoint3D(-0.30f, 0.18f, -0.08f),
+                    WirePoint3D(0.30f, 0.18f, -0.08f),
+                    WirePoint3D(0.86f, 0.06f, -0.10f),
+                    WirePoint3D(1.38f, 0.00f, -0.12f)
+                )
+            ),
+            GlassesWireframePart(
+                name = "bridge_lower",
+                color = "frame",
+                strokeWidth = 0.010f,
+                closed = false,
+                points = listOf(
+                    WirePoint3D(-0.28f, -0.12f, -0.08f),
+                    WirePoint3D(0.28f, -0.12f, -0.08f)
+                )
+            ),
+            GlassesWireframePart(
+                name = "temple_left",
+                color = "accent",
+                strokeWidth = 0.012f,
+                closed = false,
+                points = listOf(
+                    WirePoint3D(-2.85f, 0.42f, 0.18f),
+                    WirePoint3D(-3.10f, 0.42f, 0.05f),
+                    WirePoint3D(-3.45f, 0.34f, -0.10f)
+                )
+            ),
+            GlassesWireframePart(
+                name = "temple_left_lower",
+                color = "accent",
+                strokeWidth = 0.010f,
+                closed = false,
+                points = listOf(
+                    WirePoint3D(-2.85f, -0.44f, 0.18f),
+                    WirePoint3D(-3.00f, -0.28f, 0.02f),
+                    WirePoint3D(-3.20f, -0.16f, -0.18f)
+                )
+            ),
+            GlassesWireframePart(
+                name = "temple_right",
+                color = "accent",
+                strokeWidth = 0.012f,
+                closed = false,
+                points = listOf(
+                    WirePoint3D(2.85f, 0.42f, 0.18f),
+                    WirePoint3D(3.10f, 0.42f, 0.05f),
+                    WirePoint3D(3.45f, 0.34f, -0.10f)
+                )
+            ),
+            GlassesWireframePart(
+                name = "temple_right_lower",
+                color = "accent",
+                strokeWidth = 0.010f,
+                closed = false,
+                points = listOf(
+                    WirePoint3D(2.85f, -0.44f, 0.18f),
+                    WirePoint3D(3.00f, -0.28f, 0.02f),
+                    WirePoint3D(3.20f, -0.16f, -0.18f)
+                )
+            ),
+            GlassesWireframePart(
+                name = "lens_left",
+                color = "lens",
+                strokeWidth = 0.008f,
+                closed = false,
+                points = listOf(
+                    WirePoint3D(-1.78f, 0.42f, 0.04f),
+                    WirePoint3D(-1.78f, -0.42f, 0.04f)
+                )
+            ),
+            GlassesWireframePart(
+                name = "lens_right",
+                color = "lens",
+                strokeWidth = 0.008f,
+                closed = false,
+                points = listOf(
+                    WirePoint3D(1.78f, 0.42f, 0.04f),
+                    WirePoint3D(1.78f, -0.42f, 0.04f)
+                )
+            )
+        )
+    )
 }
 
 @Composable
