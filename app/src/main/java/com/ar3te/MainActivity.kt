@@ -48,6 +48,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -497,7 +499,7 @@ fun ScreenSharingScreen(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "AR3TE Display",
+                    text = "AR3TE",
                     style = MaterialTheme.typography.headlineSmall
                 )
                 Text(
@@ -543,7 +545,7 @@ fun ScreenSharingScreen(
             Spacer(modifier = Modifier.width(4.dp))
             IconButton(onClick = { showDebugMenu = !showDebugMenu }) {
                 Icon(
-                    imageVector = BugIcon,
+                    imageVector = Icons.Filled.BugReport,
                     contentDescription = "Debug"
                 )
             }
@@ -957,90 +959,6 @@ private val UnlockIcon: ImageVector =
         }
     }.build()
 
-private val BugIcon: ImageVector =
-    ImageVector.Builder(
-        name = "Bug",
-        defaultWidth = 24.dp,
-        defaultHeight = 24.dp,
-        viewportWidth = 24f,
-        viewportHeight = 24f
-    ).apply {
-        path(fill = SolidColor(Color.Black)) {
-            moveTo(9f, 4f)
-            curveTo(9f, 2.9f, 9.9f, 2f, 11f, 2f)
-            horizontalLineTo(13f)
-            curveTo(14.1f, 2f, 15f, 2.9f, 15f, 4f)
-            verticalLineTo(5f)
-            horizontalLineTo(16f)
-            curveTo(17.7f, 5f, 19f, 6.3f, 19f, 8f)
-            verticalLineTo(9f)
-            horizontalLineTo(17f)
-            verticalLineTo(8f)
-            curveTo(17f, 7.4f, 16.6f, 7f, 16f, 7f)
-            horizontalLineTo(8f)
-            curveTo(7.4f, 7f, 7f, 7.4f, 7f, 8f)
-            verticalLineTo(9f)
-            horizontalLineTo(5f)
-            verticalLineTo(8f)
-            curveTo(5f, 6.3f, 6.3f, 5f, 8f, 5f)
-            horizontalLineTo(9f)
-            close()
-            moveTo(11f, 4f)
-            verticalLineTo(5f)
-            horizontalLineTo(13f)
-            verticalLineTo(4f)
-            close()
-            moveTo(8f, 10f)
-            horizontalLineTo(16f)
-            curveTo(16.6f, 10f, 17f, 10.4f, 17f, 11f)
-            verticalLineTo(14f)
-            curveTo(17f, 17.3f, 14.3f, 20f, 11f, 20f)
-            curveTo(7.7f, 20f, 5f, 17.3f, 5f, 14f)
-            verticalLineTo(11f)
-            curveTo(5f, 10.4f, 5.4f, 10f, 6f, 10f)
-            close()
-            moveTo(7f, 12f)
-            verticalLineTo(14f)
-            curveTo(7f, 16.2f, 8.8f, 18f, 11f, 18f)
-            curveTo(13.2f, 18f, 15f, 16.2f, 15f, 14f)
-            verticalLineTo(12f)
-            close()
-            moveTo(3.5f, 11f)
-            curveTo(3.5f, 10.6f, 3.9f, 10.2f, 4.3f, 10.2f)
-            horizontalLineTo(5f)
-            verticalLineTo(12f)
-            horizontalLineTo(4.3f)
-            curveTo(3.9f, 12f, 3.5f, 11.6f, 3.5f, 11f)
-            close()
-            moveTo(20.5f, 11f)
-            curveTo(20.5f, 11.6f, 20.1f, 12f, 19.7f, 12f)
-            horizontalLineTo(19f)
-            verticalLineTo(10.2f)
-            horizontalLineTo(19.7f)
-            curveTo(20.1f, 10.2f, 20.5f, 10.6f, 20.5f, 11f)
-            close()
-            moveTo(8.2f, 16.8f)
-            lineTo(6f, 19f)
-            lineTo(4.6f, 17.6f)
-            lineTo(6.8f, 15.4f)
-            close()
-            moveTo(15.8f, 16.8f)
-            lineTo(18f, 19f)
-            lineTo(19.4f, 17.6f)
-            lineTo(17.2f, 15.4f)
-            close()
-            moveTo(8.4f, 8.2f)
-            lineTo(6.2f, 6f)
-            lineTo(7.6f, 4.6f)
-            lineTo(9.8f, 6.8f)
-            close()
-            moveTo(15.6f, 8.2f)
-            lineTo(17.8f, 6f)
-            lineTo(19.2f, 7.4f)
-            lineTo(17f, 9.6f)
-            close()
-        }
-    }.build()
 
 fun androidKeyCodeToWindowsVk(keyCode: Int): Int {
     return when (keyCode) {

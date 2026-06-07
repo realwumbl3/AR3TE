@@ -194,7 +194,6 @@ class ExternalDisplayService : LifecycleService() {
 
     private fun createNotification(): Notification {
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("AR3TE display active")
             .setContentText("Manage the AR3TE connection from the app")
             .setSmallIcon(android.R.drawable.ic_menu_gallery)
             .setPriority(NotificationCompat.PRIORITY_LOW)
