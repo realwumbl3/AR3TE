@@ -61,11 +61,11 @@ class ExternalDisplayService : LifecycleService() {
             _currentFps = value
         }
 
-    private var _currentKbps by mutableIntStateOf(0)
-    var currentKbps: Int
-        get() = _currentKbps
+    private var _currentMegabytesPerSecond by mutableStateOf(0.0)
+    var currentMegabytesPerSecond: Double
+        get() = _currentMegabytesPerSecond
         private set(value) {
-            _currentKbps = value
+            _currentMegabytesPerSecond = value
         }
 
     private var _currentCaptureMethod by mutableStateOf("Loading...")
@@ -158,9 +158,9 @@ class ExternalDisplayService : LifecycleService() {
                     is3DofEnabled = _is3DofEnabled
                     localCursorX = this@ExternalDisplayService.localCursorX
                     localCursorY = this@ExternalDisplayService.localCursorY
-                    onStatsUpdated = { f, k, method ->
+                    onStatsUpdated = { f, megabytesPerSecond, method ->
                         currentFps = f
-                        currentKbps = k
+                        currentMegabytesPerSecond = megabytesPerSecond
                         if (!method.isNullOrBlank()) {
                             currentCaptureMethod = method
                         }

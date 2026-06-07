@@ -152,7 +152,7 @@ class ExternalDisplayPresentation(
     var activeMachine by mutableStateOf<DiscoveredMachine?>(null)
     var monitorIndex by mutableIntStateOf(1)
     var is3DofEnabled by mutableStateOf(false)
-    var onStatsUpdated: ((Int, Int, String?) -> Unit)? = null
+    var onStatsUpdated: ((Int, Double, String?) -> Unit)? = null
     var onCaptureMethodUpdated: ((String) -> Unit)? = null
     var onSendMessage: ((String) -> Unit)? = null
     var onRemoteCursorReceived: ((Float, Float, Int, Int) -> Unit)? = null
@@ -212,7 +212,7 @@ fun ExternalDisplayScreen(
     machine: DiscoveredMachine? = null,
     monitorIndex: Int = 1,
     is3DofEnabled: Boolean = false,
-    onStatsUpdated: ((Int, Int, String?) -> Unit)? = null,
+    onStatsUpdated: ((Int, Double, String?) -> Unit)? = null,
     onCaptureMethodUpdated: ((String) -> Unit)? = null,
     onClientReady: ((String) -> Unit) -> Unit = {},
     onRemoteCursorReceived: (Float, Float, Int, Int) -> Unit = { _, _, _, _ -> },
@@ -266,7 +266,7 @@ fun RemoteScreenView(
     machine: DiscoveredMachine?,
     monitorIndex: Int,
     is3DofEnabled: Boolean,
-    onStatsUpdated: ((Int, Int, String?) -> Unit)? = null,
+    onStatsUpdated: ((Int, Double, String?) -> Unit)? = null,
     onCaptureMethodUpdated: ((String) -> Unit)? = null,
     onClientReady: ((String) -> Unit) -> Unit = {},
     onRemoteCursorReceived: (Float, Float, Int, Int) -> Unit = { _, _, _, _ -> },
@@ -309,12 +309,13 @@ fun RemoteScreenView(
                     frameCount++
                     val now = System.currentTimeMillis()
                     if (now - lastFpsTime >= 1000) {
+                        val elapsedSeconds = (now - lastFpsTime) / 1000.0
                         val fps = frameCount
-                        val kbps = ((byteCount * 8) / 1024).toInt()
+                        val megabytesPerSecond = (byteCount / (1024.0 * 1024.0)) / elapsedSeconds
                         withContext(Dispatchers.Main) {
-                            onStatsUpdated?.invoke(fps, kbps, captureMethod)
+                            onStatsUpdated?.invoke(fps, megabytesPerSecond, captureMethod)
                         }
-                        debugLog(REMOTE_TAG, "Stream stats: fps=$fps kbps=$kbps queuedBytes=$byteCount")
+                        debugLog(REMOTE_TAG, "Stream stats: fps=$fps MBps=$megabytesPerSecond queuedBytes=$byteCount")
                         frameCount = 0
                         byteCount = 0
                         lastFpsTime = now

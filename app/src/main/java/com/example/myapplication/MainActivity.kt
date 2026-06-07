@@ -79,6 +79,7 @@ import com.example.myapplication.discovery.MachineDiscovery
 import com.example.myapplication.ui.theme.MyApplicationTheme
 import kotlinx.coroutines.delay
 import org.json.JSONObject
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
 
@@ -160,7 +161,7 @@ class MainActivity : ComponentActivity() {
                         ScreenSharingScreen(
                             machine = machine,
                             currentFps = externalDisplayService?.currentFps ?: 0,
-                            currentKbps = externalDisplayService?.currentKbps ?: 0,
+                            currentMegabytesPerSecond = externalDisplayService?.currentMegabytesPerSecond ?: 0.0,
                             currentCaptureMethod = externalDisplayService?.currentCaptureMethod ?: "Loading...",
                             isPointerCaptured = isPointerCaptured,
                             is3DofEnabled = is3DofEnabled,
@@ -417,7 +418,7 @@ fun MachineCard(machine: DiscoveredMachine, onClick: () -> Unit) {
 fun ScreenSharingScreen(
     machine: DiscoveredMachine,
     currentFps: Int,
-    currentKbps: Int,
+    currentMegabytesPerSecond: Double,
     currentCaptureMethod: String,
     isPointerCaptured: Boolean,
     is3DofEnabled: Boolean,
@@ -611,7 +612,10 @@ fun ScreenSharingScreen(
             )
         ) {
             Row(modifier = Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(text = "FPS: $currentFps | Bitrate: $currentKbps kbps", style = MaterialTheme.typography.labelSmall)
+                Text(
+                    text = "FPS: $currentFps | Bitrate: ${String.format(Locale.US, "%.2f", currentMegabytesPerSecond)} MB/s",
+                    style = MaterialTheme.typography.labelSmall
+                )
                 Spacer(modifier = Modifier.weight(1f))
                 Text(text = currentCaptureMethod, style = MaterialTheme.typography.labelSmall)
             }
