@@ -2,9 +2,16 @@ package com.ar3te
 
 import android.app.Presentation
 import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFormat
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.media.AudioTrack
+import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.view.Choreographer
 import android.view.Display
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -86,8 +93,12 @@ enum class ExternalDisplayState {
 
 private const val REMOTE_TAG = "RemoteScreenView"
 private const val H264_TAG = "H264StreamController"
+private const val ENABLE_DEBUG_LOGS = false
 
 private fun debugLog(tag: String, message: String) {
+    if (!ENABLE_DEBUG_LOGS) {
+        return
+    }
     Log.d(tag, message)
     println("$tag: $message")
 }
@@ -154,6 +165,7 @@ class ExternalDisplayPresentation(
     var is3DofEnabled by mutableStateOf(false)
     var onStatsUpdated: ((Int, Double, String?) -> Unit)? = null
     var onCaptureMethodUpdated: ((String) -> Unit)? = null
+    var onAudioStateUpdated: ((String) -> Unit)? = null
     var onSendMessage: ((String) -> Unit)? = null
     var onRemoteCursorReceived: ((Float, Float, Int, Int) -> Unit)? = null
     
@@ -184,6 +196,7 @@ class ExternalDisplayPresentation(
                     is3DofEnabled,
                     onStatsUpdated, 
                     onCaptureMethodUpdated, 
+                    onAudioStateUpdated,
                     { onSendMessage = it },
                     { x, y, w, h -> onRemoteCursorReceived?.invoke(x, y, w, h) },
                     localCursorX,
@@ -214,6 +227,7 @@ fun ExternalDisplayScreen(
     is3DofEnabled: Boolean = false,
     onStatsUpdated: ((Int, Double, String?) -> Unit)? = null,
     onCaptureMethodUpdated: ((String) -> Unit)? = null,
+    onAudioStateUpdated: ((String) -> Unit)? = null,
     onClientReady: ((String) -> Unit) -> Unit = {},
     onRemoteCursorReceived: (Float, Float, Int, Int) -> Unit = { _, _, _, _ -> },
     localCursorX: Float = 0f,
@@ -221,13 +235,14 @@ fun ExternalDisplayScreen(
 ) {
     when (state) {
         ExternalDisplayState.IDLE -> IdleScreen()
-        ExternalDisplayState.REMOTE_SCREEN -> key(machine?.host, monitorIndex) {
+        ExternalDisplayState.REMOTE_SCREEN -> key(machine?.host) {
             RemoteScreenView(
                 machine, 
                 monitorIndex, 
                 is3DofEnabled,
                 onStatsUpdated, 
                 onCaptureMethodUpdated, 
+                onAudioStateUpdated,
                 onClientReady, 
                 onRemoteCursorReceived,
                 localCursorX,
@@ -268,16 +283,18 @@ fun RemoteScreenView(
     is3DofEnabled: Boolean,
     onStatsUpdated: ((Int, Double, String?) -> Unit)? = null,
     onCaptureMethodUpdated: ((String) -> Unit)? = null,
+    onAudioStateUpdated: ((String) -> Unit)? = null,
     onClientReady: ((String) -> Unit) -> Unit = {},
     onRemoteCursorReceived: (Float, Float, Int, Int) -> Unit = { _, _, _, _ -> },
     localCursorX: Float = 0f,
     localCursorY: Float = 0f
 ) {
     val scope = rememberCoroutineScope()
-    var client by remember(machine, monitorIndex) { mutableStateOf<WebSocketClient?>(null) }
+    val machineHost = machine?.host
+    var client by remember(machineHost) { mutableStateOf<WebSocketClient?>(null) }
     
     LaunchedEffect(client) {
-        onClientReady { msg ->
+        onClientReady { msg -> 
             client?.let {
                 if (it.isOpen) {
                     it.send(msg)
@@ -285,41 +302,43 @@ fun RemoteScreenView(
             }
         }
     }
-    var videoConfig by remember(machine, monitorIndex) { mutableStateOf<H264StreamConfig?>(null) }
-    var captureMethod by remember(machine, monitorIndex) { mutableStateOf<String?>(null) }
-    var cursor by remember(machine, monitorIndex) { mutableStateOf<RemoteCursorState?>(null) }
-    var viewSize by remember(machine, monitorIndex) { mutableStateOf(IntSize.Zero) }
-    val decoderController = remember(machine, monitorIndex) { H264StreamController(scope) }
+    LaunchedEffect(client, monitorIndex) {
+        client?.let {
+            if (it.isOpen) {
+                it.send(JSONObject().apply {
+                    put("type", "set_monitor")
+                    put("value", monitorIndex)
+                }.toString())
+            }
+        }
+    }
+    var videoConfig by remember(machineHost) { mutableStateOf<H264StreamConfig?>(null) }
+    var captureMethod by remember(machineHost) { mutableStateOf<String?>(null) }
+    var cursor by remember(machineHost) { mutableStateOf<RemoteCursorState?>(null) }
+    var viewSize by remember(machineHost) { mutableStateOf(IntSize.Zero) }
+    val decoderController = remember(machineHost) { H264StreamController(scope) }
+    val audioController = remember(machineHost) { PcmAudioController(scope) }
 
-    DisposableEffect(machine, monitorIndex) {
+    DisposableEffect(machineHost) {
         if (machine == null) {
             onDispose {}
         } else {
             debugLog(REMOTE_TAG, "Connecting to ws://${machine.host}:${machine.wsPort}")
-            val frameChannel = Channel<ByteArray>(capacity = Channel.UNLIMITED)
 
             var frameCount = 0
             var byteCount = 0L
-            var lastFpsTime = System.currentTimeMillis()
 
-            val decodeJob = scope.launch(Dispatchers.Default) {
-                for (data in frameChannel) {
-                    if (!isActive) break
-                    decoderController.queueFrame(data)
-                    frameCount++
-                    val now = System.currentTimeMillis()
-                    if (now - lastFpsTime >= 1000) {
-                        val elapsedSeconds = (now - lastFpsTime) / 1000.0
-                        val fps = frameCount
-                        val megabytesPerSecond = (byteCount / (1024.0 * 1024.0)) / elapsedSeconds
-                        withContext(Dispatchers.Main) {
-                            onStatsUpdated?.invoke(fps, megabytesPerSecond, captureMethod)
-                        }
-                        debugLog(REMOTE_TAG, "Stream stats: fps=$fps MBps=$megabytesPerSecond queuedBytes=$byteCount")
-                        frameCount = 0
-                        byteCount = 0
-                        lastFpsTime = now
+            val statsJob = scope.launch(Dispatchers.Default) {
+                while (isActive) {
+                    kotlinx.coroutines.delay(1000)
+                    val fps = frameCount
+                    val megabytesPerSecond = byteCount / (1024.0 * 1024.0)
+                    withContext(Dispatchers.Main) {
+                        onStatsUpdated?.invoke(fps, megabytesPerSecond, captureMethod)
                     }
+                    debugLog(REMOTE_TAG, "Stream stats: fps=$fps MBps=$megabytesPerSecond")
+                    frameCount = 0
+                    byteCount = 0
                 }
             }
 
@@ -355,6 +374,41 @@ fun RemoteScreenView(
                                         captureMethod = method
                                         onCaptureMethodUpdated?.invoke(method)
                                     }
+                                }
+                            }
+                            "audio_reset" -> {
+                                debugLog(REMOTE_TAG, "audio_reset received")
+                                scope.launch(Dispatchers.Main) {
+                                    audioController.resetStream()
+                                    onAudioStateUpdated?.invoke("Desktop audio reconnecting")
+                                }
+                            }
+                            "audio_status" -> {
+                                val state = json.optString("state", "unknown")
+                                val messageText = json.optString("message", state)
+                                debugLog(REMOTE_TAG, "audio_status: $state $messageText")
+                                scope.launch(Dispatchers.Main) {
+                                    onAudioStateUpdated?.invoke(messageText)
+                                }
+                            }
+                            "audio_config" -> {
+                                try {
+                                    val nextConfig = RemoteAudioConfig(
+                                        sampleRate = json.optInt("sample_rate", 48000),
+                                        channels = json.optInt("channels", 2),
+                                        frameDurationMs = json.optInt("frame_duration_ms", 20),
+                                        sampleFormat = json.optString("sample_format", "s16le")
+                                    )
+                                    debugLog(
+                                        REMOTE_TAG,
+                                        "audio_config received: ${nextConfig.sampleRate}Hz ${nextConfig.channels}ch format=${nextConfig.sampleFormat} frame=${nextConfig.frameDurationMs}ms"
+                                    )
+                                    scope.launch(Dispatchers.Main) {
+                                        audioController.configure(nextConfig)
+                                        onAudioStateUpdated?.invoke("Desktop audio connected")
+                                    }
+                                } catch (e: Exception) {
+                                    debugError(REMOTE_TAG, "Failed to parse audio_config", e)
                                 }
                             }
                             "cursor" -> {
@@ -430,13 +484,33 @@ fun RemoteScreenView(
                 override fun onMessage(bytes: ByteBuffer?) {
                     bytes?.let {
                         val size = it.remaining()
-                        byteCount += size
                         val data = ByteArray(size)
                         it.get(data)
-                        if (frameCount == 0) {
-                            debugLog(REMOTE_TAG, "First video payload received: $size bytes")
+                        if (data.isNotEmpty()) {
+                            when (data[0].toInt() and 0xff) {
+                                1 -> {
+                                    val payload = data.copyOfRange(1, data.size)
+                                    byteCount += payload.size
+                                    frameCount++
+                                    if (frameCount == 1) {
+                                        debugLog(REMOTE_TAG, "First video payload received: ${payload.size} bytes")
+                                    }
+                                    decoderController.queueFrame(payload)
+                                }
+                                2 -> {
+                                    val payload = data.copyOfRange(1, data.size)
+                                    audioController.queuePacket(payload)
+                                }
+                                else -> {
+                                    byteCount += size
+                                    frameCount++
+                                    if (frameCount == 1) {
+                                        debugLog(REMOTE_TAG, "First legacy video payload received: $size bytes")
+                                    }
+                                    decoderController.queueFrame(data)
+                                }
+                            }
                         }
-                        frameChannel.trySend(data)
                     }
                 }
 
@@ -455,15 +529,15 @@ fun RemoteScreenView(
             onDispose {
                 debugLog(REMOTE_TAG, "Disconnecting")
                 wsClient.close()
-                decodeJob.cancel()
-                frameChannel.close()
+                statsJob.cancel()
                 decoderController.release()
+                audioController.release()
                 client = null
             }
         }
     }
 
-    key(machine?.host, monitorIndex) {
+    key(machine?.host) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -493,13 +567,11 @@ fun RemoteScreenView(
                     AndroidView(
                         factory = { context ->
                             SurfaceView(context).apply {
-                                debugLog(REMOTE_TAG, "SurfaceView created")
                                 holder.addCallback(decoderController)
                                 decoderController.bindSurface(holder)
                             }
                         },
                         update = { view ->
-                            debugLog(REMOTE_TAG, "SurfaceView updated")
                             decoderController.bindSurface(view.holder)
                         },
                         modifier = Modifier.fillMaxSize()
@@ -908,6 +980,9 @@ class H264StreamController(
     private val frameQueue = Channel<ByteArray>(Channel.UNLIMITED)
     private val pendingFrames = ArrayDeque<ByteArray>()
     private val codecLock = Any()
+    private val outputLock = Any()
+    private val readyOutputs = ArrayDeque<ReadyOutput>()
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var pendingConfig: H264StreamConfig? = null
     private var surface: Surface? = null
     private var codec: MediaCodec? = null
@@ -916,7 +991,16 @@ class H264StreamController(
     private var nextPtsUs = 0L
     private var frameDurationUs = 16_666L
     @Volatile
+    private var frameCallbackPosted = false
+    @Volatile
     private var waitingForKeyframe = true
+    private var renderCount = 0
+    private var renderStatsLastMs = 0L
+    private var renderGapSumMs = 0.0
+    private var renderGapMaxMs = 0.0
+    private var renderGapMinMs = Double.POSITIVE_INFINITY
+    private var renderGapCount = 0
+    private var lastRenderMs = 0L
 
     fun configure(config: H264StreamConfig) {
         debugLog(H264_TAG, "configure: ${config.width}x${config.height} fps=${config.fps} encoder=${config.encoder}")
@@ -940,10 +1024,6 @@ class H264StreamController(
             waitingForKeyframe = false
             debugLog(H264_TAG, "Keyframe received, starting decode queue")
         }
-        val firstQueued = synchronized(codecLock) { pendingFrames.isEmpty() }
-        if (firstQueued) {
-            debugLog(H264_TAG, "queueFrame: first queued packet=${frame.size} bytes")
-        }
         frameQueue.trySend(frame)
     }
 
@@ -951,9 +1031,26 @@ class H264StreamController(
         synchronized(codecLock) {
             surface = holder.surface
         }
-        val surface = holder.surface
-        debugLog(H264_TAG, "bindSurface: surface=${surface != null} valid=${surface?.isValid == true}")
+        debugLog(H264_TAG, "bindSurface: surface=${holder.surface != null} valid=${holder.surface?.isValid == true}")
         maybeStartCodec()
+    }
+
+    override fun surfaceCreated(holder: SurfaceHolder) {
+        debugLog(H264_TAG, "surfaceCreated")
+        bindSurface(holder)
+    }
+
+    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        debugLog(H264_TAG, "surfaceChanged: format=$format size=${width}x$height")
+        bindSurface(holder)
+    }
+
+    override fun surfaceDestroyed(holder: SurfaceHolder) {
+        debugLog(H264_TAG, "surfaceDestroyed")
+        synchronized(codecLock) {
+            surface = null
+        }
+        stopCodec()
     }
 
     fun release() {
@@ -975,24 +1072,6 @@ class H264StreamController(
         stopCodec()
     }
 
-    override fun surfaceCreated(holder: SurfaceHolder) {
-        debugLog(H264_TAG, "surfaceCreated")
-        bindSurface(holder)
-    }
-
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        debugLog(H264_TAG, "surfaceChanged: format=$format size=${width}x$height")
-        bindSurface(holder)
-    }
-
-    override fun surfaceDestroyed(holder: SurfaceHolder) {
-        debugLog(H264_TAG, "surfaceDestroyed")
-        synchronized(codecLock) {
-            surface = null
-        }
-        stopCodec()
-    }
-
     private fun maybeStartCodec() {
         val config = synchronized(codecLock) { pendingConfig } ?: return
         val targetSurface = synchronized(codecLock) { surface } ?: return
@@ -1007,6 +1086,12 @@ class H264StreamController(
                 setByteBuffer("csd-1", ByteBuffer.wrap(withStartCode(config.pps)))
                 setInteger(MediaFormat.KEY_FRAME_RATE, config.fps)
                 setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, config.width * config.height * 4)
+                setInteger("priority", 0)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                } else {
+                    setInteger("low-latency", 1)
+                }
             }
 
             val decoder = MediaCodec.createDecoderByType("video/avc")
@@ -1015,19 +1100,24 @@ class H264StreamController(
             synchronized(codecLock) {
                 codec = decoder
                 nextPtsUs = 0L
+                resetRenderStats()
             }
+            clearReadyOutputs(null)
             debugLog(H264_TAG, "Decoder started")
 
             drainJob?.cancel()
             drainJob = scope.launch(Dispatchers.Default) {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY)
                 while (isActive && isCurrentCodec(decoder)) {
-                    drainOutput(decoder)
-                    kotlinx.coroutines.delay(4)
+                    if (!drainOutput(decoder)) {
+                        kotlinx.coroutines.delay(1)
+                    }
                 }
             }
 
             inputJob?.cancel()
             inputJob = scope.launch(Dispatchers.Default) {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY)
                 for (frame in frameQueue) {
                     if (!isActive || !isCurrentCodec(decoder)) break
                     synchronized(codecLock) {
@@ -1053,7 +1143,6 @@ class H264StreamController(
             } ?: return
             val inputIndex = decoder.dequeueInputBuffer(5_000)
             if (inputIndex < 0) {
-                debugLog(H264_TAG, "dequeueInputBuffer returned $inputIndex, requeue frame=${frame.size}")
                 synchronized(codecLock) {
                     pendingFrames.addFirst(frame)
                 }
@@ -1062,7 +1151,6 @@ class H264StreamController(
 
             val inputBuffer = decoder.getInputBuffer(inputIndex)
             if (inputBuffer == null) {
-                debugLog(H264_TAG, "inputBuffer null, requeue frame=${frame.size}")
                 synchronized(codecLock) {
                     pendingFrames.addFirst(frame)
                 }
@@ -1071,17 +1159,92 @@ class H264StreamController(
 
             inputBuffer.clear()
             inputBuffer.put(frame)
-            decoder.queueInputBuffer(inputIndex, 0, frame.size, nextPtsUs, 0)
-            debugLog(H264_TAG, "queued frame=${frame.size} ptsUs=$nextPtsUs")
-            nextPtsUs += frameDurationUs
+            val ptsUs = synchronized(codecLock) {
+                val pts = nextPtsUs
+                nextPtsUs += frameDurationUs
+                pts
+            }
+            decoder.queueInputBuffer(inputIndex, 0, frame.size, ptsUs, 0)
         }
     }
 
-    private fun drainOutput(decoder: MediaCodec) {
+    private fun enqueueReadyOutput(bufferIndex: Int) {
+        synchronized(outputLock) {
+            readyOutputs.addLast(ReadyOutput(bufferIndex))
+        }
+        requestVsyncRelease()
+    }
+
+    private fun requestVsyncRelease() {
+        if (frameCallbackPosted) {
+            return
+        }
+        frameCallbackPosted = true
+        mainHandler.post {
+            val decoder = synchronized(codecLock) { codec }
+            if (decoder == null) {
+                frameCallbackPosted = false
+                return@post
+            }
+            Choreographer.getInstance().postFrameCallback(vsyncFrameCallback)
+        }
+    }
+
+    private val vsyncFrameCallback = Choreographer.FrameCallback { frameTimeNanos ->
+        frameCallbackPosted = false
+        val decoder = synchronized(codecLock) { codec } ?: return@FrameCallback
+        if (!isCurrentCodec(decoder)) {
+            return@FrameCallback
+        }
+
+        val outputs = synchronized(outputLock) {
+            val backlog = readyOutputs.size
+            val releaseCount = if (backlog > MAX_READY_FRAMES) 2 else 1
+            buildList {
+                repeat(releaseCount.coerceAtMost(readyOutputs.size)) {
+                    readyOutputs.pollFirst()?.let { add(it) }
+                }
+            }
+        }
+
+        outputs.forEachIndexed { index, ready ->
+            noteRender()
+            val presentTimeNs = if (index == 0 && outputs.size == 1) {
+                frameTimeNanos
+            } else {
+                System.nanoTime()
+            }
+            decoder.releaseOutputBuffer(ready.bufferIndex, presentTimeNs)
+        }
+
+        synchronized(outputLock) {
+            if (readyOutputs.isNotEmpty()) {
+                requestVsyncRelease()
+            }
+        }
+    }
+
+    private fun clearReadyOutputs(decoder: MediaCodec?) {
+        frameCallbackPosted = false
+        val pending = synchronized(outputLock) {
+            val copy = readyOutputs.toList()
+            readyOutputs.clear()
+            copy
+        }
+        pending.forEach { ready ->
+            try {
+                decoder?.releaseOutputBuffer(ready.bufferIndex, false)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun drainOutput(decoder: MediaCodec): Boolean {
         val info = MediaCodec.BufferInfo()
+        var rendered = false
         while (isCurrentCodec(decoder)) {
             when (val outputIndex = decoder.dequeueOutputBuffer(info, 0)) {
-                MediaCodec.INFO_TRY_AGAIN_LATER -> return
+                MediaCodec.INFO_TRY_AGAIN_LATER -> return rendered
                 MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                     debugLog(H264_TAG, "Output format changed: ${decoder.outputFormat}")
                     continue
@@ -1092,16 +1255,61 @@ class H264StreamController(
                 }
                 else -> {
                     if (outputIndex >= 0) {
-                        if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                            debugLog(H264_TAG, "Dropping codec config output buffer")
-                        } else if (info.size > 0) {
-                            debugLog(H264_TAG, "Rendered frame size=${info.size} ptsUs=${info.presentationTimeUs} flags=${info.flags}")
+                        val shouldRender = info.size > 0 &&
+                            info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0
+                        if (shouldRender) {
+                            enqueueReadyOutput(outputIndex)
+                            rendered = true
+                        } else {
+                            decoder.releaseOutputBuffer(outputIndex, false)
                         }
-                        decoder.releaseOutputBuffer(outputIndex, true)
                     }
                 }
             }
         }
+        return rendered
+    }
+
+    private fun noteRender() {
+        if (!ENABLE_DEBUG_LOGS) {
+            return
+        }
+        val nowMs = System.currentTimeMillis()
+        if (lastRenderMs > 0L) {
+            val gapMs = (nowMs - lastRenderMs).toDouble()
+            renderGapSumMs += gapMs
+            renderGapCount += 1
+            renderGapMaxMs = maxOf(renderGapMaxMs, gapMs)
+            renderGapMinMs = minOf(renderGapMinMs, gapMs)
+        }
+        lastRenderMs = nowMs
+        renderCount += 1
+        if (nowMs - renderStatsLastMs >= 1000) {
+            val avgGap = if (renderGapCount > 0) renderGapSumMs / renderGapCount else 0.0
+            debugLog(
+                H264_TAG,
+                "render pacing: fps=$renderCount avgGapMs=${"%.1f".format(Locale.US, avgGap)} " +
+                    "minGapMs=${if (renderGapMinMs.isInfinite()) "n/a" else "%.1f".format(Locale.US, renderGapMinMs)} " +
+                    "maxGapMs=${"%.1f".format(Locale.US, renderGapMaxMs)} " +
+                    "inputDepth=${pendingFrames.size} readyDepth=${readyOutputs.size}"
+            )
+            renderCount = 0
+            renderStatsLastMs = nowMs
+            renderGapSumMs = 0.0
+            renderGapMaxMs = 0.0
+            renderGapMinMs = Double.POSITIVE_INFINITY
+            renderGapCount = 0
+        }
+    }
+
+    private fun resetRenderStats() {
+        renderCount = 0
+        renderStatsLastMs = System.currentTimeMillis()
+        renderGapSumMs = 0.0
+        renderGapMaxMs = 0.0
+        renderGapMinMs = Double.POSITIVE_INFINITY
+        renderGapCount = 0
+        lastRenderMs = 0L
     }
 
     private fun stopCodec() {
@@ -1111,8 +1319,10 @@ class H264StreamController(
             pendingFrames.clear()
             nextPtsUs = 0L
             waitingForKeyframe = true
+            resetRenderStats()
             current
         }
+        clearReadyOutputs(decoder)
         try {
             decoder?.stop()
         } catch (_: Exception) {
@@ -1156,4 +1366,180 @@ class H264StreamController(
         return false
     }
 
+    private data class ReadyOutput(val bufferIndex: Int)
+
+    companion object {
+        private const val MAX_READY_FRAMES = 2
+    }
+}
+
+data class RemoteAudioConfig(
+    val sampleRate: Int,
+    val channels: Int,
+    val frameDurationMs: Int,
+    val sampleFormat: String
+)
+
+class PcmAudioController(
+    private val scope: kotlinx.coroutines.CoroutineScope
+) {
+    private val packetQueue = Channel<ByteArray>(Channel.UNLIMITED)
+    private val pendingPackets = ArrayDeque<ByteArray>()
+    private val codecLock = Any()
+    private var pendingConfig: RemoteAudioConfig? = null
+    private var audioTrack: AudioTrack? = null
+    private var inputJob: Job? = null
+    private var outputJob: Job? = null
+
+    fun configure(config: RemoteAudioConfig) {
+        debugLog("RemoteAudio", "configure: ${config.sampleRate}Hz ${config.channels}ch format=${config.sampleFormat}")
+        synchronized(codecLock) {
+            pendingConfig = config
+        }
+        if (hasTrack()) {
+            stopTrack()
+        }
+        maybeStartTrack()
+    }
+
+    fun queuePacket(packet: ByteArray) {
+        if (packet.isEmpty()) {
+            return
+        }
+        packetQueue.trySend(packet)
+    }
+
+    fun resetStream() {
+        debugLog("RemoteAudio", "resetStream")
+        synchronized(codecLock) {
+            pendingConfig = null
+        }
+        stopTrack()
+    }
+
+    fun release() {
+        debugLog("RemoteAudio", "release")
+        inputJob?.cancel()
+        outputJob?.cancel()
+        inputJob = null
+        outputJob = null
+        packetQueue.close()
+        stopTrack()
+    }
+
+    private fun maybeStartTrack() {
+        val config = synchronized(codecLock) { pendingConfig } ?: return
+        if (hasTrack()) {
+            return
+        }
+
+        try {
+            val channelMask = when (config.channels) {
+                1 -> AudioFormat.CHANNEL_OUT_MONO
+                else -> AudioFormat.CHANNEL_OUT_STEREO
+            }
+            val minBufferSize = AudioTrack.getMinBufferSize(
+                config.sampleRate,
+                channelMask,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+            val bufferSize = maxOf(minBufferSize, config.sampleRate * maxOf(1, config.channels) * 2 / 5, 4096)
+            val track = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(config.sampleRate)
+                        .setChannelMask(channelMask)
+                        .build()
+                )
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .setBufferSizeInBytes(bufferSize)
+                .build()
+
+            synchronized(codecLock) {
+                audioTrack = track
+            }
+            track.play()
+            debugLog("RemoteAudio", "AudioTrack started")
+
+            inputJob?.cancel()
+            inputJob = scope.launch(Dispatchers.Default) {
+                for (packet in packetQueue) {
+                    if (!isActive || !hasTrack()) break
+                    synchronized(codecLock) {
+                        pendingPackets.addLast(packet)
+                    }
+                    drainPackets()
+                }
+            }
+
+            outputJob?.cancel()
+            outputJob = scope.launch(Dispatchers.Default) {
+                while (isActive && hasTrack()) {
+                    drainPackets()
+                    kotlinx.coroutines.delay(4)
+                }
+            }
+        } catch (e: Exception) {
+            debugError("RemoteAudio", "Failed to start audio output", e)
+            stopTrack()
+        }
+    }
+
+    private fun drainPackets() {
+        val track = synchronized(codecLock) { audioTrack } ?: return
+        while (true) {
+            val packet = synchronized(codecLock) {
+                if (pendingPackets.isEmpty()) null else pendingPackets.removeFirst()
+            } ?: return
+            try {
+                var offset = 0
+                while (offset < packet.size && hasTrack()) {
+                    val written = track.write(packet, offset, packet.size - offset, AudioTrack.WRITE_BLOCKING)
+                    if (written <= 0) {
+                        break
+                    }
+                    offset += written
+                }
+            } catch (e: Exception) {
+                debugError("RemoteAudio", "Audio write failed", e)
+                stopTrack()
+                return
+            }
+        }
+    }
+
+    private fun stopTrack() {
+        val track = synchronized(codecLock) {
+            val currentTrack = audioTrack
+            audioTrack = null
+            pendingPackets.clear()
+            currentTrack
+        }
+        try {
+            track?.pause()
+        } catch (_: Exception) {
+        }
+        try {
+            track?.flush()
+        } catch (_: Exception) {
+        }
+        try {
+            track?.stop()
+        } catch (_: Exception) {
+        }
+        try {
+            track?.release()
+        } catch (_: Exception) {
+        }
+        debugLog("RemoteAudio", "AudioTrack stopped")
+    }
+
+    private fun hasTrack(): Boolean = synchronized(codecLock) { audioTrack != null }
 }

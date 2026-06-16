@@ -48,8 +48,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -65,20 +63,19 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.graphics.vector.path
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.ar3te.discovery.DiscoveredMachine
@@ -86,7 +83,6 @@ import com.ar3te.discovery.MachineDiscovery
 import com.ar3te.ui.theme.AR3TETheme
 import kotlinx.coroutines.delay
 import org.json.JSONObject
-import java.util.Locale
 
 class MainActivity : ComponentActivity() {
 
@@ -169,7 +165,8 @@ class MainActivity : ComponentActivity() {
                             machine = machine,
                             currentFps = externalDisplayService?.currentFps ?: 0,
                             currentMegabytesPerSecond = externalDisplayService?.currentMegabytesPerSecond ?: 0.0,
-                            currentCaptureMethod = externalDisplayService?.currentCaptureMethod ?: "Loading...",
+                            currentCaptureMethod = externalDisplayService?.currentCaptureMethod ?: stringResource(R.string.loading),
+                            currentAudioState = externalDisplayService?.currentAudioState ?: stringResource(R.string.loading),
                             isPointerCaptured = isPointerCaptured,
                             is3DofEnabled = is3DofEnabled,
                             onStop = { 
@@ -377,14 +374,14 @@ fun HomeScreen(
             .padding(16.dp)
     ) {
         Text(
-            text = "AR3TE Hosts",
+            text = stringResource(R.string.home_title),
             style = MaterialTheme.typography.headlineMedium
         )
         Spacer(modifier = Modifier.height(12.dp))
 
         if (discoveredMachines.isEmpty()) {
             Text(
-                text = "Scanning the local network...",
+                text = stringResource(R.string.home_scanning),
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -413,7 +410,7 @@ fun MachineCard(machine: DiscoveredMachine, onClick: () -> Unit) {
                 style = MaterialTheme.typography.titleMedium
             )
             Text(
-                text = "${machine.host}:${machine.port}",
+                text = stringResource(R.string.machine_address, machine.host, machine.port),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -427,6 +424,7 @@ fun ScreenSharingScreen(
     currentFps: Int,
     currentMegabytesPerSecond: Double,
     currentCaptureMethod: String,
+    currentAudioState: String,
     isPointerCaptured: Boolean,
     is3DofEnabled: Boolean,
     onStop: () -> Unit,
@@ -499,7 +497,7 @@ fun ScreenSharingScreen(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "AR3TE",
+                    text = stringResource(R.string.screen_title),
                     style = MaterialTheme.typography.headlineSmall
                 )
                 Text(
@@ -513,8 +511,8 @@ fun ScreenSharingScreen(
                 onMonitorSwitch(monitorIndex)
             }) {
                 Icon(
-                    imageVector = MonitorSwitchIcon,
-                    contentDescription = "Switch monitor"
+                    painter = painterResource(R.drawable.ic_monitor_switch),
+                    contentDescription = stringResource(R.string.switch_monitor)
                 )
             }
             Spacer(modifier = Modifier.width(4.dp))
@@ -523,8 +521,8 @@ fun ScreenSharingScreen(
                 keyboardController?.show()
             }) {
                 Icon(
-                    imageVector = KeyboardIcon,
-                    contentDescription = "Show keyboard"
+                    painter = painterResource(R.drawable.ic_keyboard),
+                    contentDescription = stringResource(R.string.show_keyboard)
                 )
             }
             Spacer(modifier = Modifier.width(4.dp))
@@ -538,15 +536,15 @@ fun ScreenSharingScreen(
                 onCaptureToggle(!isPointerCaptured)
             }) {
                 Icon(
-                    imageVector = if (isPointerCaptured) UnlockIcon else LockIcon,
-                    contentDescription = if (isPointerCaptured) "Unlock pointer" else "Lock pointer"
+                    painter = painterResource(if (isPointerCaptured) R.drawable.ic_unlock else R.drawable.ic_lock),
+                    contentDescription = stringResource(if (isPointerCaptured) R.string.unlock_pointer else R.string.lock_pointer)
                 )
             }
             Spacer(modifier = Modifier.width(4.dp))
             IconButton(onClick = { showDebugMenu = !showDebugMenu }) {
                 Icon(
-                    imageVector = Icons.Filled.BugReport,
-                    contentDescription = "Debug"
+                    painter = painterResource(R.drawable.ic_bug_report),
+                    contentDescription = stringResource(R.string.debug)
                 )
             }
         }
@@ -559,14 +557,14 @@ fun ScreenSharingScreen(
                 )
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    Text("Debug Menu", style = MaterialTheme.typography.titleMedium)
+                    Text(stringResource(R.string.debug_menu_title), style = MaterialTheme.typography.titleMedium)
                     Spacer(modifier = Modifier.height(8.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(
                             checked = is3DofEnabled,
                             onCheckedChange = { on3DofToggle(it) }
                         )
-                        Text("Enable 3DOF View (Rayneo Air 3S Pro)")
+                        Text(stringResource(R.string.enable_3dof_view))
                     }
                     if (is3DofEnabled) {
                         Spacer(modifier = Modifier.height(8.dp))
@@ -637,13 +635,18 @@ fun ScreenSharingScreen(
                 containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f)
             )
         ) {
-            Row(modifier = Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = "FPS: $currentFps | Bitrate: ${String.format(Locale.US, "%.2f", currentMegabytesPerSecond)} MB/s",
-                    style = MaterialTheme.typography.labelSmall
-                )
-                Spacer(modifier = Modifier.weight(1f))
+            Column(modifier = Modifier.padding(8.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = stringResource(R.string.stats_text, currentFps, currentMegabytesPerSecond),
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+                Spacer(modifier = Modifier.height(4.dp))
                 Text(text = currentCaptureMethod, style = MaterialTheme.typography.labelSmall)
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(text = currentAudioState, style = MaterialTheme.typography.labelSmall)
             }
         }
 
@@ -756,7 +759,7 @@ fun ScreenSharingScreen(
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    text = if (isPointerCaptured) "POINTER CAPTURED" else "VIRTUAL TRACKPAD",
+                    text = if (isPointerCaptured) stringResource(R.string.trackpad_captured) else stringResource(R.string.trackpad_idle),
                     color = Color.DarkGray,
                     style = MaterialTheme.typography.titleLarge
                 )
@@ -766,199 +769,6 @@ fun ScreenSharingScreen(
         Spacer(modifier = Modifier.height(8.dp))
     }
 }
-
-private val MonitorSwitchIcon: ImageVector =
-    ImageVector.Builder(
-        name = "MonitorSwitch",
-        defaultWidth = 24.dp,
-        defaultHeight = 24.dp,
-        viewportWidth = 24f,
-        viewportHeight = 24f
-    ).apply {
-        path(fill = SolidColor(Color.Black)) {
-            moveTo(3f, 5f)
-            horizontalLineTo(21f)
-            verticalLineTo(16f)
-            horizontalLineTo(3f)
-            close()
-            moveTo(5f, 7f)
-            verticalLineTo(14f)
-            horizontalLineTo(19f)
-            verticalLineTo(7f)
-            close()
-            moveTo(9f, 18f)
-            horizontalLineTo(15f)
-            verticalLineTo(20f)
-            horizontalLineTo(9f)
-            close()
-            moveTo(15.5f, 8.5f)
-            lineTo(18f, 11f)
-            lineTo(15.5f, 13.5f)
-            verticalLineTo(12f)
-            horizontalLineTo(12f)
-            verticalLineTo(10f)
-            horizontalLineTo(15.5f)
-            close()
-            moveTo(8.5f, 13.5f)
-            lineTo(6f, 11f)
-            lineTo(8.5f, 8.5f)
-            verticalLineTo(10f)
-            horizontalLineTo(12f)
-            verticalLineTo(12f)
-            horizontalLineTo(8.5f)
-            close()
-        }
-    }.build()
-
-private val KeyboardIcon: ImageVector =
-    ImageVector.Builder(
-        name = "Keyboard",
-        defaultWidth = 24.dp,
-        defaultHeight = 24.dp,
-        viewportWidth = 24f,
-        viewportHeight = 24f
-    ).apply {
-        path(fill = SolidColor(Color.Black)) {
-            moveTo(4f, 5f)
-            horizontalLineTo(20f)
-            curveTo(21.1f, 5f, 22f, 5.9f, 22f, 7f)
-            verticalLineTo(17f)
-            curveTo(22f, 18.1f, 21.1f, 19f, 20f, 19f)
-            horizontalLineTo(4f)
-            curveTo(2.9f, 19f, 2f, 18.1f, 2f, 17f)
-            verticalLineTo(7f)
-            curveTo(2f, 5.9f, 2.9f, 5f, 4f, 5f)
-            close()
-            moveTo(4f, 7f)
-            verticalLineTo(17f)
-            horizontalLineTo(20f)
-            verticalLineTo(7f)
-            close()
-            moveTo(5f, 9f)
-            horizontalLineTo(7f)
-            verticalLineTo(11f)
-            horizontalLineTo(5f)
-            close()
-            moveTo(8f, 9f)
-            horizontalLineTo(10f)
-            verticalLineTo(11f)
-            horizontalLineTo(8f)
-            close()
-            moveTo(11f, 9f)
-            horizontalLineTo(13f)
-            verticalLineTo(11f)
-            horizontalLineTo(11f)
-            close()
-            moveTo(14f, 9f)
-            horizontalLineTo(16f)
-            verticalLineTo(11f)
-            horizontalLineTo(14f)
-            close()
-            moveTo(17f, 9f)
-            horizontalLineTo(19f)
-            verticalLineTo(11f)
-            horizontalLineTo(17f)
-            close()
-            moveTo(5f, 12f)
-            horizontalLineTo(7f)
-            verticalLineTo(14f)
-            horizontalLineTo(5f)
-            close()
-            moveTo(8f, 12f)
-            horizontalLineTo(10f)
-            verticalLineTo(14f)
-            horizontalLineTo(8f)
-            close()
-            moveTo(11f, 12f)
-            horizontalLineTo(13f)
-            verticalLineTo(14f)
-            horizontalLineTo(11f)
-            close()
-            moveTo(14f, 12f)
-            horizontalLineTo(16f)
-            verticalLineTo(14f)
-            horizontalLineTo(14f)
-            close()
-            moveTo(17f, 12f)
-            horizontalLineTo(19f)
-            verticalLineTo(14f)
-            horizontalLineTo(17f)
-            close()
-            moveTo(8f, 15f)
-            horizontalLineTo(16f)
-            verticalLineTo(16f)
-            horizontalLineTo(8f)
-            close()
-        }
-    }.build()
-
-private val LockIcon: ImageVector =
-    ImageVector.Builder(
-        name = "Lock",
-        defaultWidth = 24.dp,
-        defaultHeight = 24.dp,
-        viewportWidth = 24f,
-        viewportHeight = 24f
-    ).apply {
-        path(fill = SolidColor(Color.Black)) {
-            moveTo(7f, 10f)
-            verticalLineTo(8f)
-            curveTo(7f, 5.2f, 9.2f, 3f, 12f, 3f)
-            reflectiveCurveTo(17f, 5.2f, 17f, 8f)
-            verticalLineTo(10f)
-            horizontalLineTo(18f)
-            curveTo(19.1f, 10f, 20f, 10.9f, 20f, 12f)
-            verticalLineTo(20f)
-            horizontalLineTo(4f)
-            verticalLineTo(12f)
-            curveTo(4f, 10.9f, 4.9f, 10f, 6f, 10f)
-            close()
-            moveTo(9f, 10f)
-            horizontalLineTo(15f)
-            verticalLineTo(8f)
-            curveTo(15f, 6.3f, 13.7f, 5f, 12f, 5f)
-            reflectiveCurveTo(9f, 6.3f, 9f, 8f)
-            close()
-            moveTo(6f, 12f)
-            verticalLineTo(18f)
-            horizontalLineTo(18f)
-            verticalLineTo(12f)
-            close()
-        }
-    }.build()
-
-private val UnlockIcon: ImageVector =
-    ImageVector.Builder(
-        name = "Unlock",
-        defaultWidth = 24.dp,
-        defaultHeight = 24.dp,
-        viewportWidth = 24f,
-        viewportHeight = 24f
-    ).apply {
-        path(fill = SolidColor(Color.Black)) {
-            moveTo(8f, 10f)
-            verticalLineTo(8f)
-            curveTo(8f, 5.2f, 10.2f, 3f, 13f, 3f)
-            curveTo(15.4f, 3f, 17.5f, 4.7f, 18f, 7f)
-            horizontalLineTo(16f)
-            curveTo(15.6f, 5.8f, 14.5f, 5f, 13f, 5f)
-            curveTo(11.3f, 5f, 10f, 6.3f, 10f, 8f)
-            verticalLineTo(10f)
-            horizontalLineTo(18f)
-            curveTo(19.1f, 10f, 20f, 10.9f, 20f, 12f)
-            verticalLineTo(20f)
-            horizontalLineTo(4f)
-            verticalLineTo(12f)
-            curveTo(4f, 10.9f, 4.9f, 10f, 6f, 10f)
-            close()
-            moveTo(6f, 12f)
-            verticalLineTo(18f)
-            horizontalLineTo(18f)
-            verticalLineTo(12f)
-            close()
-        }
-    }.build()
-
 
 fun androidKeyCodeToWindowsVk(keyCode: Int): Int {
     return when (keyCode) {
@@ -1096,7 +906,7 @@ private fun ThreeDofPhoneStatus() {
     }
 
     Text(
-        text = "3DOF: $status",
+        text = stringResource(R.string.three_dof_status, status),
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.primary
     )
@@ -1108,25 +918,25 @@ private fun ThreeDofPhoneStatus() {
     Spacer(modifier = Modifier.height(8.dp))
     Row(verticalAlignment = Alignment.CenterVertically) {
         Button(onClick = { tracker.reset() }) {
-            Text("Reset orientation")
+            Text(stringResource(R.string.reset_orientation))
         }
         Spacer(modifier = Modifier.width(8.dp))
         Button(onClick = { vizObject = tracker.cycleVizObject() }) {
             Text(
                 when (vizObject) {
-                    RayNeoGlassesTracker.VizObject.AXIS -> "Viz: Axis"
-                    RayNeoGlassesTracker.VizObject.GLASSES -> "Viz: Glasses"
+                    RayNeoGlassesTracker.VizObject.AXIS -> stringResource(R.string.viz_axis)
+                    RayNeoGlassesTracker.VizObject.GLASSES -> stringResource(R.string.viz_glasses)
                 }
             )
         }
     }
     Text(
-        text = "Reset re-zeros HUD. Hold still ~2s on connect for gyro bias calibration.",
+        text = stringResource(R.string.reset_orientation_hint),
         style = MaterialTheme.typography.labelSmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant
     )
     Text(
-        text = "USB permission appears on this phone screen, not the glasses.",
+        text = stringResource(R.string.usb_permission_hint),
         style = MaterialTheme.typography.labelSmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant
     )

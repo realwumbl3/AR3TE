@@ -1,3 +1,24 @@
 <resources>
     <string name="app_name">AR3TE</string>
+    <string name="home_title">AR3TE Hosts</string>
+    <string name="home_scanning">Scanning the local network...</string>
+    <string name="screen_title">AR3TE</string>
+    <string name="loading">Loading...</string>
+    <string name="switch_monitor">Switch monitor</string>
+    <string name="show_keyboard">Show keyboard</string>
+    <string name="lock_pointer">Lock pointer</string>
+    <string name="unlock_pointer">Unlock pointer</string>
+    <string name="debug">Debug</string>
+    <string name="debug_menu_title">Debug Menu</string>
+    <string name="enable_3dof_view">Enable 3DOF View (Rayneo Air 3S Pro)</string>
+    <string name="trackpad_captured">POINTER CAPTURED</string>
+    <string name="trackpad_idle">VIRTUAL TRACKPAD</string>
+    <string name="three_dof_status">3DOF: %1$s</string>
+    <string name="reset_orientation">Reset orientation</string>
+    <string name="viz_axis">Viz: Axis</string>
+    <string name="viz_glasses">Viz: Glasses</string>
+    <string name="reset_orientation_hint">Reset re-zeros HUD. Hold still ~2s on connect for gyro bias calibration.</string>
+    <string name="usb_permission_hint">USB permission appears on this phone screen, not the glasses.</string>
+    <string name="stats_text">FPS: %1$d | Bitrate: %2$.2f MB/s</string>
+    <string name="machine_address">%1$s:%2$d</string>
 </resources>

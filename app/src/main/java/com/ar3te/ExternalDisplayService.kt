@@ -75,6 +75,13 @@ class ExternalDisplayService : LifecycleService() {
             _currentCaptureMethod = value
         }
 
+    private var _currentAudioState by mutableStateOf("Loading...")
+    var currentAudioState: String
+        get() = _currentAudioState
+        private set(value) {
+            _currentAudioState = value
+        }
+
     var localCursorX by mutableStateOf(0f)
     var localCursorY by mutableStateOf(0f)
     var lastLocalMoveTime by mutableStateOf(0L)
@@ -167,6 +174,9 @@ class ExternalDisplayService : LifecycleService() {
                     }
                     onCaptureMethodUpdated = { method ->
                         currentCaptureMethod = method
+                    }
+                    onAudioStateUpdated = { state ->
+                        currentAudioState = state
                     }
                     onRemoteCursorReceived = { x, y, w, h ->
                         syncLocalCursorFromRemote(x, y, w, h)

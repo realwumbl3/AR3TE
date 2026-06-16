@@ -1,4 +1,5 @@
 const dgram = require("dgram");
+const { performance } = require("perf_hooks");
 const os = require("os");
 const http = require("http");
 const fs = require("fs");
@@ -9,6 +10,21 @@ const { WebSocketServer } = require("ws");
 const PORT = 45678;
 const WS_PORT = 45679;
 const DISCOVER_MSG = "AR3TE_DISCOVER";
+const VIDEO_BINARY_TYPE = 1;
+const AUDIO_BINARY_TYPE = 2;
+const AUDIO_SAMPLE_RATE = 48000;
+const AUDIO_CHANNELS = 2;
+const AUDIO_FRAME_DURATION_MS = 20;
+const AUDIO_DEVICE_CANDIDATES = [
+  process.env.AR3TE_AUDIO_DEVICE,
+  "virtual-audio-capturer",
+  "CABLE Output (VB-Audio Virtual Cable)",
+  "Stereo Mix",
+].filter(Boolean);
+const PORT_RECLAIM_TIMEOUT_MS = 10000;
+const PORT_RECLAIM_POLL_MS = 200;
+let discoverySocket = null;
+let discoveryBindAttempts = 0;
 
 function getPidsOnPort(port) {
   const pids = new Set();
@@ -76,11 +92,55 @@ function killPid(pid) {
   }
 }
 
-function killExistingInstances() {
-  const pids = new Set([...getPidsOnPort(PORT), ...getPidsOnPort(WS_PORT)]);
+function sleepSync(ms) {
+  const shared = new SharedArrayBuffer(4);
+  const view = new Int32Array(shared);
+  Atomics.wait(view, 0, 0, ms);
+}
 
-  for (const pid of pids) {
-    killPid(pid);
+function waitForPortsToBeFree(ports, timeoutMs = PORT_RECLAIM_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const pids = new Set();
+    for (const port of ports) {
+      for (const pid of getPidsOnPort(port)) {
+        pids.add(pid);
+      }
+    }
+    if (pids.size === 0) {
+      return true;
+    }
+    sleepSync(PORT_RECLAIM_POLL_MS);
+  }
+  return false;
+}
+
+function killExistingInstances() {
+  const ports = [PORT, WS_PORT];
+  const seen = new Set();
+  const deadline = Date.now() + PORT_RECLAIM_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    const pids = new Set();
+    for (const port of ports) {
+      for (const pid of getPidsOnPort(port)) {
+        pids.add(pid);
+      }
+    }
+
+    for (const pid of pids) {
+      if (seen.has(pid)) {
+        continue;
+      }
+      seen.add(pid);
+      killPid(pid);
+    }
+
+    if (waitForPortsToBeFree(ports, PORT_RECLAIM_POLL_MS)) {
+      break;
+    }
+
+    sleepSync(PORT_RECLAIM_POLL_MS);
   }
 
   if (process.platform === "win32") {
@@ -97,12 +157,15 @@ function killExistingInstances() {
     }
   }
 
-  if (pids.size > 0) {
-    console.log(`Stopped ${pids.size} existing server instance(s)`);
-    const deadline = Date.now() + 500;
-    while (Date.now() < deadline) {
-      // Allow the OS to release ports before rebinding
-    }
+  if (seen.size > 0) {
+    console.log(`Stopped ${seen.size} existing server instance(s)`);
+  }
+
+  if (!waitForPortsToBeFree(ports, PORT_RECLAIM_POLL_MS)) {
+    console.warn(
+      `Timed out waiting for ports ${ports.join(", ")} to become free; ` +
+        "continuing with startup anyway"
+    );
   }
 }
 
@@ -124,42 +187,62 @@ const machineName = os.hostname();
 const localIp = getLocalIpv4();
 
 // --- UDP Discovery ---
-const socket = dgram.createSocket("udp4");
+function createDiscoverySocket() {
+  const socket = dgram.createSocket("udp4");
 
-socket.on("message", (message, remote) => {
-  if (message.toString() !== DISCOVER_MSG) {
-    return;
-  }
+  socket.on("message", (message, remote) => {
+    if (message.toString() !== DISCOVER_MSG) {
+      return;
+    }
 
-  const payload = JSON.stringify({
-    type: "ar3te",
-    name: machineName,
-    host: localIp,
-    port: PORT,
-    wsPort: WS_PORT,
+    const payload = JSON.stringify({
+      type: "ar3te",
+      name: machineName,
+      host: localIp,
+      port: PORT,
+      wsPort: WS_PORT,
+    });
+
+    socket.send(payload, remote.port, remote.address);
   });
 
-  socket.send(payload, remote.port, remote.address);
-});
+  socket.on("error", (error) => {
+    if (error.code === "EADDRINUSE" && discoveryBindAttempts < 5) {
+      console.warn(`Port ${PORT} is busy, retrying discovery bind...`);
+      killExistingInstances();
+      try {
+        socket.close();
+      } catch {
+        // Socket may already be closing or closed.
+      }
+      const retryDelay = Math.min(1000, 200 * discoveryBindAttempts);
+      setTimeout(bindDiscoverySocket, retryDelay);
+      return;
+    }
 
-socket.on("error", (error) => {
-  if (error.code === "EADDRINUSE") {
-    console.error(`Port ${PORT} is already in use.`);
+    console.error(error.code === "EADDRINUSE" ? `Port ${PORT} is already in use.` : error);
     process.exit(1);
-  }
-  console.error(error);
-  process.exit(1);
-});
+  });
 
-socket.on("listening", () => {
-  socket.setBroadcast(true);
-  console.log("AR3TE host server running");
-  console.log(`  Machine: ${machineName}`);
-  console.log(`  UDP Discovery: ${localIp}:${PORT}`);
-  console.log(`  WebSocket Stream: ws://${localIp}:${WS_PORT}`);
-});
+  socket.on("listening", () => {
+    socket.setBroadcast(true);
+    discoverySocket = socket;
+    console.log("AR3TE host server running");
+    console.log(`  Machine: ${machineName}`);
+    console.log(`  UDP Discovery: ${localIp}:${PORT}`);
+    console.log(`  WebSocket Stream: ws://${localIp}:${WS_PORT}`);
+  });
 
-socket.bind(PORT);
+  return socket;
+}
+
+function bindDiscoverySocket() {
+  discoveryBindAttempts += 1;
+  discoverySocket = createDiscoverySocket();
+  discoverySocket.bind(PORT);
+}
+
+bindDiscoverySocket();
 
 // --- GPU H.264 Capture Process ---
 const ffmpegCandidates = [
@@ -181,6 +264,7 @@ const captureEncoders = ["h264_nvenc"];
 let captureProcess = null;
 let rawCaptureProcess = null;
 let cursorCaptureProcess = null;
+let audioCaptureProcess = null;
 let inputProcess = null;
 let shuttingDown = false;
 let activeMonitorIndex = 0;
@@ -198,10 +282,34 @@ let sentVideoConfig = false;
 let loggedFirstFrame = false;
 let restartRequested = false;
 let rawCaptureStderrBuffer = "";
+let audioOggBuffer = Buffer.alloc(0);
+let audioPacketParts = [];
+let currentAudioState = "starting";
+let lastAudioConfig = null;
+let sentAudioConfig = false;
+let lastAudioStatus = null;
+let audioDeviceName = null;
+let audioDeviceIndex = -1;
 let lastCursorMessage = null;
 let currentCaptureMethod = "";
 let directCaptureAllowed = true;
 let wss = null;
+const DEBUG_PACING = process.env.AR3TE_DEBUG_PACING !== "0";
+const TARGET_FRAME_INTERVAL_MS = 1000 / 60;
+let videoSendQueue = [];
+let videoSendTimer = null;
+let lastVideoSendMs = 0;
+let nextVideoSendAt = 0;
+let pacingStats = {
+  accessUnits: 0,
+  bytes: 0,
+  lastLogMs: Date.now(),
+  lastSendMs: 0,
+  maxGapMs: 0,
+  minGapMs: Number.POSITIVE_INFINITY,
+  gapSumMs: 0,
+  gapCount: 0,
+};
 
 function findExecutable(candidates) {
   for (const candidate of candidates) {
@@ -320,6 +428,21 @@ function resetStreamState() {
   sentVideoConfig = false;
   loggedFirstFrame = false;
   lastCursorMessage = null;
+  resetPacingStats();
+  resetVideoSendPacer();
+}
+
+function resetAudioStreamState() {
+  if ((lastAudioConfig || lastAudioStatus) && wss) {
+    broadcastText(JSON.stringify({ type: "audio_reset" }));
+  }
+  audioOggBuffer = Buffer.alloc(0);
+  audioPacketParts = [];
+  lastAudioConfig = null;
+  sentAudioConfig = false;
+  lastAudioStatus = null;
+  audioDeviceName = null;
+  audioDeviceIndex = -1;
 }
 
 function stopRawCaptureProcess() {
@@ -344,7 +467,274 @@ function stopCaptureProcess() {
   }
 }
 
-function sendBinary(frame) {
+function stopAudioCaptureProcess() {
+  if (audioCaptureProcess && !audioCaptureProcess.killed) {
+    audioCaptureProcess.kill();
+  }
+  audioCaptureProcess = null;
+}
+
+function sendAudioStatus(state, message) {
+  currentAudioState = state;
+  lastAudioStatus = {
+    type: "audio_status",
+    state,
+    message,
+  };
+  broadcastText(JSON.stringify(lastAudioStatus));
+}
+
+function sendAudioConfig() {
+  if (!lastAudioConfig || sentAudioConfig) {
+    return;
+  }
+  console.log(
+    `Sending audio_config ${lastAudioConfig.sample_rate}Hz ` +
+      `${lastAudioConfig.channels}ch opus frame=${lastAudioConfig.frame_duration_ms}ms`
+  );
+  broadcastText(JSON.stringify(lastAudioConfig));
+  sentAudioConfig = true;
+}
+
+function emitAudioPacket(packet) {
+  if (!packet || packet.length === 0) {
+    return;
+  }
+  if (!lastAudioConfig) {
+    return;
+  }
+  if (!sentAudioConfig) {
+    sendAudioConfig();
+  }
+  const payload = Buffer.concat([Buffer.from([AUDIO_BINARY_TYPE]), Buffer.from(packet)]);
+  if (wss) {
+    wss.clients.forEach((client) => {
+      if (client.readyState === 1) {
+        client.send(payload);
+      }
+    });
+  }
+}
+
+function parseOpusHead(packet) {
+  if (!packet || packet.length < 19) {
+    return null;
+  }
+  if (packet.slice(0, 8).toString("ascii") !== "OpusHead") {
+    return null;
+  }
+
+  return {
+    type: "audio_config",
+    codec: "audio/opus",
+    sample_rate: packet.readUInt32LE(12),
+    channels: packet.readUInt8(9),
+    pre_skip: packet.readUInt16LE(10),
+    output_gain: packet.readUInt16LE(16),
+    channel_mapping_family: packet.readUInt8(18),
+    frame_duration_ms: AUDIO_FRAME_DURATION_MS,
+    head: packet.toString("base64"),
+  };
+}
+
+function handleAudioPacket(packet) {
+  if (!packet || packet.length === 0) {
+    return;
+  }
+
+  if (packet.slice(0, 8).toString("ascii") === "OpusHead") {
+    const config = parseOpusHead(packet);
+    if (config) {
+      lastAudioConfig = config;
+      sentAudioConfig = false;
+      sendAudioConfig();
+      sendAudioStatus("active", "Desktop audio connected");
+    }
+    return;
+  }
+
+  if (packet.slice(0, 8).toString("ascii") === "OpusTags") {
+    return;
+  }
+
+  if (!lastAudioConfig) {
+    return;
+  }
+
+  emitAudioPacket(packet);
+}
+
+function parseOggAudioStream(chunk) {
+  audioOggBuffer = Buffer.concat([audioOggBuffer, chunk]);
+
+  while (audioOggBuffer.length >= 27) {
+    const signatureIndex = audioOggBuffer.indexOf("OggS");
+    if (signatureIndex < 0) {
+      audioOggBuffer = audioOggBuffer.slice(Math.max(0, audioOggBuffer.length - 3));
+      return;
+    }
+
+    if (signatureIndex > 0) {
+      audioOggBuffer = audioOggBuffer.slice(signatureIndex);
+    }
+
+    if (audioOggBuffer.length < 27) {
+      return;
+    }
+
+    const segmentCount = audioOggBuffer.readUInt8(26);
+    const headerLength = 27 + segmentCount;
+    if (audioOggBuffer.length < headerLength) {
+      return;
+    }
+
+    let pageLength = headerLength;
+    for (let i = 0; i < segmentCount; i++) {
+      pageLength += audioOggBuffer.readUInt8(27 + i);
+    }
+
+    if (audioOggBuffer.length < pageLength) {
+      return;
+    }
+
+    const page = audioOggBuffer.slice(0, pageLength);
+    audioOggBuffer = audioOggBuffer.slice(pageLength);
+
+    let offset = 27 + segmentCount;
+    for (let i = 0; i < segmentCount; i++) {
+      const segmentLength = page.readUInt8(27 + i);
+      if (segmentLength > 0) {
+        audioPacketParts.push(page.slice(offset, offset + segmentLength));
+      } else if (audioPacketParts.length === 0) {
+        audioPacketParts.push(Buffer.alloc(0));
+      }
+      offset += segmentLength;
+
+      if (segmentLength < 255) {
+        const packet = Buffer.concat(audioPacketParts);
+        audioPacketParts = [];
+        handleAudioPacket(packet);
+      }
+    }
+  }
+}
+
+function resetVideoSendPacer() {
+  videoSendQueue = [];
+  if (videoSendTimer) {
+    clearTimeout(videoSendTimer);
+    videoSendTimer = null;
+  }
+  lastVideoSendMs = 0;
+  nextVideoSendAt = 0;
+}
+
+function enqueueVideoFrame(frame) {
+  videoSendQueue.push(frame);
+  if (videoSendTimer) {
+    return;
+  }
+
+  if (nextVideoSendAt === 0) {
+    flushOneVideoFrame();
+    nextVideoSendAt = performance.now() + TARGET_FRAME_INTERVAL_MS;
+  }
+
+  scheduleVideoSend();
+}
+
+function flushOneVideoFrame() {
+  if (videoSendQueue.length === 0) {
+    return;
+  }
+  const frame = videoSendQueue.shift();
+  lastVideoSendMs = Date.now();
+  sendBinaryImmediate(frame);
+}
+
+function scheduleVideoSend() {
+  if (videoSendTimer || videoSendQueue.length === 0) {
+    return;
+  }
+  const delay = Math.max(0, nextVideoSendAt - performance.now());
+  videoSendTimer = setTimeout(fireVideoSend, delay > 0 ? delay : 0);
+}
+
+function fireVideoSend() {
+  videoSendTimer = null;
+  if (videoSendQueue.length === 0) {
+    nextVideoSendAt = 0;
+    return;
+  }
+
+  flushOneVideoFrame();
+
+  const now = performance.now();
+  if (nextVideoSendAt === 0) {
+    nextVideoSendAt = now + TARGET_FRAME_INTERVAL_MS;
+  } else {
+    nextVideoSendAt += TARGET_FRAME_INTERVAL_MS;
+  }
+
+  if (now > nextVideoSendAt + TARGET_FRAME_INTERVAL_MS * 1.5) {
+    nextVideoSendAt = now + TARGET_FRAME_INTERVAL_MS;
+  }
+
+  if (videoSendQueue.length > 0) {
+    scheduleVideoSend();
+  }
+}
+
+function resetPacingStats() {
+  pacingStats = {
+    accessUnits: 0,
+    bytes: 0,
+    lastLogMs: Date.now(),
+    lastSendMs: 0,
+    maxGapMs: 0,
+    minGapMs: Number.POSITIVE_INFINITY,
+    gapSumMs: 0,
+    gapCount: 0,
+  };
+}
+
+function notePacingSend(byteLength) {
+  if (!DEBUG_PACING) {
+    return;
+  }
+  const now = Date.now();
+  if (pacingStats.lastSendMs > 0) {
+    const gapMs = now - pacingStats.lastSendMs;
+    pacingStats.gapSumMs += gapMs;
+    pacingStats.gapCount += 1;
+    pacingStats.maxGapMs = Math.max(pacingStats.maxGapMs, gapMs);
+    pacingStats.minGapMs = Math.min(pacingStats.minGapMs, gapMs);
+  }
+  pacingStats.lastSendMs = now;
+  pacingStats.accessUnits += 1;
+  pacingStats.bytes += byteLength;
+  if (now - pacingStats.lastLogMs >= 1000) {
+    const avgGapMs = pacingStats.gapCount > 0
+      ? (pacingStats.gapSumMs / pacingStats.gapCount).toFixed(1)
+      : "n/a";
+    console.log(
+      `[pacing] au/s=${pacingStats.accessUnits} ` +
+        `kbps=${Math.round((pacingStats.bytes * 8) / 1000)} ` +
+        `queue=${videoSendQueue.length} ` +
+        `gapMs avg=${avgGapMs} min=${pacingStats.minGapMs === Number.POSITIVE_INFINITY ? "n/a" : pacingStats.minGapMs} ` +
+        `max=${pacingStats.maxGapMs}`
+    );
+    pacingStats.accessUnits = 0;
+    pacingStats.bytes = 0;
+    pacingStats.lastLogMs = now;
+    pacingStats.maxGapMs = 0;
+    pacingStats.minGapMs = Number.POSITIVE_INFINITY;
+    pacingStats.gapSumMs = 0;
+    pacingStats.gapCount = 0;
+  }
+}
+
+function sendBinaryImmediate(frame) {
   if (!loggedFirstFrame) {
     console.log(`First video payload sent (${frame.length} bytes)`);
     loggedFirstFrame = true;
@@ -352,11 +742,17 @@ function sendBinary(frame) {
   if (!wss) {
     return;
   }
+  const payload = Buffer.concat([Buffer.from([VIDEO_BINARY_TYPE]), Buffer.from(frame)]);
+  notePacingSend(payload.length);
   wss.clients.forEach((client) => {
     if (client.readyState === 1) { // OPEN
-      client.send(frame);
+      client.send(payload);
     }
   });
+}
+
+function sendBinary(frame) {
+  enqueueVideoFrame(frame);
 }
 
 function broadcastText(message) {
@@ -458,7 +854,7 @@ function flushAccessUnit(accessUnit, isKeyframe) {
 
   const frame = Buffer.concat(chunks);
   if (isKeyframe) {
-    lastKeyframe = frame;
+    lastKeyframe = Buffer.concat([Buffer.from([VIDEO_BINARY_TYPE]), frame]);
   }
   sendBinary(frame);
 }
@@ -609,7 +1005,14 @@ function getCaptureDescription(monitorInfo, monitorIndex) {
   return "raw Capture.exe pipe";
 }
 
+function getVideoBitrateKbps(videoInfo) {
+  const pixelsPerFrame = Math.max(1, videoInfo.width * videoInfo.height);
+  const target = Math.round((pixelsPerFrame * 60 * 0.12) / 1000);
+  return Math.max(8000, Math.min(35000, target));
+}
+
 function buildRawFfmpegArgs(encoderName, videoInfo) {
+  const bitrateKbps = getVideoBitrateKbps(videoInfo);
   const common = [
     "-hide_banner",
     "-loglevel",
@@ -625,6 +1028,8 @@ function buildRawFfmpegArgs(encoderName, videoInfo) {
     "-i",
     "pipe:0",
     "-an",
+    "-vsync",
+    "cfr",
   ];
 
   if (encoderName === "h264_nvenc") {
@@ -638,17 +1043,23 @@ function buildRawFfmpegArgs(encoderName, videoInfo) {
       "-tune",
       "ll",
       "-rc",
-      "vbr",
-      "-cq",
-      "19",
+      "cbr",
       "-b:v",
-      "0",
+      `${bitrateKbps}k`,
+      "-maxrate",
+      `${bitrateKbps}k`,
+      "-bufsize",
+      `${Math.max(1000, Math.round(bitrateKbps / 2))}k`,
       "-g",
-      "30",
+      "60",
+      "-keyint_min",
+      "60",
       "-bf",
       "0",
       "-zerolatency",
       "1",
+      "-rc-lookahead",
+      "0",
       "-aud",
       "1",
       "-bsf:v",
@@ -671,17 +1082,23 @@ function buildRawFfmpegArgs(encoderName, videoInfo) {
     "-tune",
     "ll",
     "-rc",
-    "vbr",
-    "-cq",
-    "19",
+    "cbr",
     "-b:v",
-    "0",
+    `${bitrateKbps}k`,
+    "-maxrate",
+    `${bitrateKbps}k`,
+    "-bufsize",
+    `${Math.max(1000, Math.round(bitrateKbps / 2))}k`,
     "-g",
-    "30",
+    "60",
+    "-keyint_min",
+    "60",
     "-bf",
     "0",
     "-zerolatency",
     "1",
+    "-rc-lookahead",
+    "0",
     "-aud",
     "1",
     "-bsf:v",
@@ -693,6 +1110,7 @@ function buildRawFfmpegArgs(encoderName, videoInfo) {
 }
 
 function buildDirectFfmpegArgs(probeInfo, videoInfo) {
+  const bitrateKbps = getVideoBitrateKbps(videoInfo);
   const captureInput = [
     `ddagrab=output_idx=${probeInfo.outputIndex}`,
     `framerate=60`,
@@ -704,7 +1122,11 @@ function buildDirectFfmpegArgs(probeInfo, videoInfo) {
     "allow_fallback=1",
   ].join(":");
 
-  return [
+  const needsScale =
+    videoInfo.width !== probeInfo.width ||
+    videoInfo.height !== probeInfo.height;
+
+  const args = [
     "-hide_banner",
     "-loglevel",
     "error",
@@ -717,6 +1139,16 @@ function buildDirectFfmpegArgs(probeInfo, videoInfo) {
     "-i",
     captureInput,
     "-an",
+  ];
+
+  if (needsScale) {
+    args.push(
+      "-vf",
+      `hwdownload,format=bgra,scale=${videoInfo.width}:${videoInfo.height}:flags=fast_bilinear,format=nv12`
+    );
+  }
+
+  return args.concat([
     "-c:v",
     "h264_nvenc",
     "-preset",
@@ -724,25 +1156,35 @@ function buildDirectFfmpegArgs(probeInfo, videoInfo) {
     "-tune",
     "ll",
     "-rc",
-    "vbr",
-    "-cq",
-    "19",
+    "cbr",
     "-b:v",
-    "0",
+    `${bitrateKbps}k`,
+    "-maxrate",
+    `${bitrateKbps}k`,
+    "-bufsize",
+    `${Math.max(1000, Math.round(bitrateKbps / 2))}k`,
     "-g",
-    "30",
+    "60",
+    "-keyint_min",
+    "60",
     "-bf",
     "0",
     "-zerolatency",
     "1",
+    "-rc-lookahead",
+    "0",
     "-aud",
     "1",
+    "-r",
+    "60",
+    "-vsync",
+    "cfr",
     "-bsf:v",
     "dump_extra,h264_metadata=aud=insert",
     "-f",
     "h264",
     "pipe:1",
-  ];
+  ]);
 }
 
 let currentEncoderName = captureEncoders[0];
@@ -862,10 +1304,7 @@ function startDirectCapturePipeline() {
   rawCaptureStderrBuffer = "";
   currentCaptureMethod = "Direct D3D11 duplicate output -> NVENC";
   const captureExe = path.join(__dirname, "Capture.exe");
-  activeVideoInfo = {
-    width: probeInfo.width,
-    height: probeInfo.height,
-  };
+  activeVideoInfo = getStreamSize(activeMonitorInfo, activeMonitorIndex);
   const cursorArgs = ["--cursor-only", "--monitor", String(activeMonitorIndex + 1), "--stream-size", `${activeVideoInfo.width}x${activeVideoInfo.height}`];
   const ffmpegArgs = buildDirectFfmpegArgs(probeInfo, activeVideoInfo);
   console.log(
@@ -929,12 +1368,134 @@ function startCaptureProcess() {
   startRawCapturePipeline();
 }
 
+function buildAudioFfmpegArgs(device) {
+  if (!device) {
+    throw new Error(
+      "No DirectShow audio capture device found. Install a loopback device like virtual-audio-capturer."
+    );
+  }
+  return [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-thread_queue_size",
+    "512",
+    "-f",
+    "dshow",
+    "-i",
+    `audio=${device}`,
+    "-ac",
+    String(AUDIO_CHANNELS),
+    "-ar",
+    String(AUDIO_SAMPLE_RATE),
+    "-acodec",
+    "pcm_s16le",
+    "-f",
+    "s16le",
+    "pipe:1",
+  ];
+}
+
+function startAudioCapturePipeline() {
+  if (shuttingDown) {
+    return;
+  }
+
+  if (!ffmpegPath) {
+    throw new Error("No ffmpeg runtime found");
+  }
+
+  stopAudioCaptureProcess();
+  resetAudioStreamState();
+  lastAudioConfig = {
+    type: "audio_config",
+    codec: "audio/pcm",
+    sample_rate: AUDIO_SAMPLE_RATE,
+    channels: AUDIO_CHANNELS,
+    sample_format: "s16le",
+    frame_duration_ms: AUDIO_FRAME_DURATION_MS,
+  };
+  sentAudioConfig = false;
+  sendAudioStatus("starting", "Desktop audio capture starting");
+  sendAudioConfig();
+
+  const devices = AUDIO_DEVICE_CANDIDATES.length ? AUDIO_DEVICE_CANDIDATES : [null];
+
+  const tryStart = (index) => {
+    if (shuttingDown) {
+      return;
+    }
+
+    audioDeviceIndex = index;
+    const device = devices[index];
+    if (!device) {
+      console.error("Desktop audio unavailable: no DirectShow audio capture devices remain");
+      sendAudioStatus("unavailable", "Desktop audio unavailable");
+      return;
+    }
+
+    let audioArgs;
+    try {
+      audioArgs = buildAudioFfmpegArgs(device);
+    } catch (err) {
+      console.error(`Desktop audio unavailable: ${err.message || err}`);
+      sendAudioStatus("unavailable", err.message || "Desktop audio unavailable");
+      return;
+    }
+
+    audioDeviceName = device;
+    console.log(`Starting desktop audio capture on DirectShow device: ${device}`);
+    audioCaptureProcess = spawn(ffmpegPath, audioArgs, { stdio: ["ignore", "pipe", "pipe"] });
+    sendAudioStatus("active", `Desktop audio connected (${device})`);
+
+    audioCaptureProcess.stdout.on("data", (chunk) => {
+      emitAudioPacket(chunk);
+    });
+
+    let stderrBuffer = "";
+    audioCaptureProcess.stderr.on("data", (chunk) => {
+      const text = chunk.toString("utf8");
+      stderrBuffer += text;
+      process.stderr.write(`[audio] ${text}`);
+    });
+
+    audioCaptureProcess.on("exit", (code, signal) => {
+      if (shuttingDown) {
+        return;
+      }
+
+      if (code === 0) {
+        console.log("Desktop audio capture ended cleanly");
+        sendAudioStatus("stopped", "Desktop audio ended");
+        return;
+      }
+
+      console.error(`desktop audio capture exited (code=${code}, signal=${signal}) on ${device}`);
+      const nextIndex = index + 1;
+      if (nextIndex < devices.length) {
+        stopAudioCaptureProcess();
+        setTimeout(() => tryStart(nextIndex), 300);
+        return;
+      }
+
+      sendAudioStatus(
+        "unavailable",
+        stderrBuffer.trim() || `Desktop audio capture exited (code=${code}, signal=${signal})`
+      );
+      stopAudioCaptureProcess();
+    });
+  };
+
+  tryStart(0);
+}
+
 ffmpegPath = findExecutable(ffmpegCandidates);
 if (!ffmpegPath) {
   throw new Error("No ffmpeg runtime found");
 }
 
 startCaptureProcess();
+startAudioCapturePipeline();
 
 function startInputProcess() {
   if (shuttingDown) return;
@@ -974,12 +1535,21 @@ startInputProcess();
 
 // --- WebSocket Server ---
 const server = http.createServer();
-wss = new WebSocketServer({ server });
+wss = new WebSocketServer({ server, perMessageDeflate: false });
 
 wss.on("connection", (ws) => {
+  if (ws._socket?.setNoDelay) {
+    ws._socket.setNoDelay(true);
+  }
   console.log("Client connected");
   if (lastVideoConfig) {
     ws.send(JSON.stringify(lastVideoConfig));
+  }
+  if (lastAudioConfig) {
+    ws.send(JSON.stringify(lastAudioConfig));
+  }
+  if (lastAudioStatus) {
+    ws.send(JSON.stringify(lastAudioStatus));
   }
   if (lastKeyframe) {
     ws.send(lastKeyframe);
@@ -1047,6 +1617,7 @@ server.listen(WS_PORT);
 function shutdown() {
   shuttingDown = true;
   stopCaptureProcess();
+  stopAudioCaptureProcess();
   stopInputProcess();
   process.exit(0);
 }
@@ -1055,4 +1626,5 @@ process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 process.on("exit", () => {
   stopCaptureProcess();
+  stopAudioCaptureProcess();
 });

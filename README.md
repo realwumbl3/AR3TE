@@ -9,7 +9,7 @@ AR3TE is an Android remote display client for AR glasses and mobile devices. It 
 AR3TE pairs an Android client with a Windows host server:
 
 - Android app: discovers AR3TE hosts on the LAN, displays the live remote screen, and provides virtual trackpad, keyboard, monitor switching, and RayNeo 3DOF controls.
-- Host server (`server/`): handles UDP discovery, screen capture, cursor/control messages, and WebSocket video streaming.
+- Host server (`server/`): handles UDP discovery, screen capture, desktop audio capture, cursor/control messages, and WebSocket media streaming.
 
 ## Requirements
 
@@ -25,6 +25,7 @@ AR3TE pairs an Android client with a Windows host server:
 - Node.js 18+
 - .NET SDK to build `Capture.exe` from `server/Capture.cs`
 - FFmpeg available on `PATH` or through `FFMPEG_PATH`
+- FFmpeg build with DirectShow audio capture
 
 ## Getting Started
 
@@ -70,7 +71,7 @@ server/   Windows host
 
 1. The Android app broadcasts `AR3TE_DISCOVER` over UDP.
 2. The host server responds with machine name, IP address, and stream ports.
-3. The app connects via WebSocket and receives video frames from the host capture pipeline.
+3. The app connects via WebSocket and receives video frames plus desktop audio from the host capture pipeline.
 4. Monitor selection, cursor movement, keyboard input, and debug controls are sent back to the host as JSON control messages.
 
 ## License

@@ -25,6 +25,7 @@ namespace RemoteDesktop {
         private static string lastCursorBase64 = "";
         private static int lastCursorHotX = 0;
         private static int lastCursorHotY = 0;
+        private static string lastCursorMetadataJson = "";
 
         private sealed class MonitorProbeInfo {
             public int AdapterIndex;
@@ -35,7 +36,7 @@ namespace RemoteDesktop {
 
         private const int TARGET_FPS = 60;
         private const int FRAME_INTERVAL_MS = 1000 / TARGET_FPS;
-        private const int DXGI_FRAME_TIMEOUT_MS = 16;
+        private const int DXGI_FRAME_TIMEOUT_MS = 1;
 
         [DllImport("user32.dll")]
         private static extern bool SetProcessDPIAware();
@@ -57,6 +58,9 @@ namespace RemoteDesktop {
 
         [DllImport("user32.dll")]
         private static extern bool GetCursorPos(out POINT point);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetCursorPos(int X, int Y);
 
         [DllImport("user32.dll")]
         private static extern IntPtr GetCursor();
@@ -267,12 +271,12 @@ namespace RemoteDesktop {
                                 uint flag = 0;
                                 if (parts[1] == "l") flag = MOUSEEVENTF_LEFTUP;
                                 else if (parts[1] == "r") flag = MOUSEEVENTF_RIGHTUP;
-                                else if (parts[1] == "m") flag = MOU
-                            if (parts.LengthSEEVENTF_MIDDLEUP;
+                                else if (parts[1] == "m") flag = MOUSEEVENTF_MIDDLEUP;
                                 if (flag != 0) mouse_event(flag, 0, 0, 0, 0);
                             }
                             break;
-                        case "mw": >= 2) {
+                        case "mw":
+                            if (parts.Length >= 2) {
                                 int delta = int.Parse(parts[1]);
                                 mouse_event(MOUSEEVENTF_WHEEL, 0, 0, (uint)delta, 0);
                             }
@@ -388,10 +392,7 @@ namespace RemoteDesktop {
                             activeMonitor = currentTarget;
                         }
 
-                        if (!capturer.CaptureRawFrame(stdout)) {
-                            continue;
-                        }
-                        stdout.Flush();
+                        capturer.CaptureRawFrame(stdout);
 
                         nextFrameMs += FRAME_INTERVAL_MS;
                         long sleepMs = nextFrameMs - frameTimer.ElapsedMilliseconds;
@@ -536,6 +537,10 @@ namespace RemoteDesktop {
             try {
                 string imagePart = !string.IsNullOrEmpty(base64) ? $",\"img\":\"{base64}\"" : "";
                 string json = $"{{\"type\":\"cursor\",\"visible\":{(visible ? "true" : "false")},\"x\":{x},\"y\":{y},\"w\":{width},\"h\":{height},\"hx\":{hotX},\"hy\":{hotY}{imagePart}}}";
+                if (json == lastCursorMetadataJson) {
+                    return;
+                }
+                lastCursorMetadataJson = json;
                 Console.Error.WriteLine("CURSOR " + json);
                 Console.Error.Flush();
             } catch { }
@@ -732,11 +737,18 @@ namespace RemoteDesktop {
                 var data = source.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
                 try {
                     int rowBytes = source.Width * 4;
-                    byte[] row = new byte[rowBytes];
-                    for (int y = 0; y < source.Height; y++) {
-                        Marshal.Copy(data.Scan0 + y * data.Stride, row, 0, rowBytes);
-                        output.Write(row, 0, rowBytes);
+                    int totalBytes = rowBytes * source.Height;
+                    byte[] frame = new byte[totalBytes];
+                    if (data.Stride == rowBytes) {
+                        Marshal.Copy(data.Scan0, frame, 0, totalBytes);
+                    } else {
+                        int offset = 0;
+                        for (int y = 0; y < source.Height; y++) {
+                            Marshal.Copy(data.Scan0 + y * data.Stride, frame, offset, rowBytes);
+                            offset += rowBytes;
+                        }
                     }
+                    output.Write(frame, 0, totalBytes);
                 } finally {
                     source.UnlockBits(data);
                 }
@@ -767,6 +779,8 @@ namespace RemoteDesktop {
             private int pointerY;
             private bool canMapDesktopSurface;
             private bool emittedInitialFrame;
+            private int lastEmittedPointerX = int.MinValue;
+            private int lastEmittedPointerY = int.MinValue;
 
             public override void Initialize(int monitorIndex) {
                 DisposeDxgi();
@@ -823,6 +837,8 @@ namespace RemoteDesktop {
                 int height = (int)desc.ModeDescription.Height;
                 canMapDesktopSurface = true;
                 emittedInitialFrame = false;
+                lastEmittedPointerX = int.MinValue;
+                lastEmittedPointerY = int.MinValue;
 
                 var outputDesc = output.Description;
                 monitorOriginX = outputDesc.DesktopCoordinates.Left;
@@ -964,12 +980,20 @@ namespace RemoteDesktop {
                     var result = duplication.AcquireNextFrame(DXGI_FRAME_TIMEOUT_MS, out var frameInfo, out desktopResource);
                     if (result.Failure) {
                         if (result.Code == DXGI_ERROR_WAIT_TIMEOUT) {
+                            RefreshPointerPosition();
                             if (!emittedInitialFrame) {
                                 CaptureScreenSnapshot(desktopBitmap);
                                 emittedInitialFrame = true;
+                                lastEmittedPointerX = pointerX;
+                                lastEmittedPointerY = pointerY;
                                 return true;
                             }
-                            return true;
+                            if (pointerX != lastEmittedPointerX || pointerY != lastEmittedPointerY) {
+                                lastEmittedPointerX = pointerX;
+                                lastEmittedPointerY = pointerY;
+                                return true;
+                            }
+                            return false;
                         }
                         if (result.Code == DXGI_ERROR_ACCESS_LOST) throw new InvalidOperationException("DXGI access lost");
                         throw new InvalidOperationException("AcquireNextFrame failed");
@@ -978,6 +1002,9 @@ namespace RemoteDesktop {
                     acquired = true;
                     UpdatePointerMetadata(frameInfo);
                     CopyFrameToBitmap(desktopResource, desktopBitmap);
+                    RefreshPointerPosition();
+                    lastEmittedPointerX = pointerX;
+                    lastEmittedPointerY = pointerY;
                     emittedInitialFrame = true;
                     return true;
                 } finally {
