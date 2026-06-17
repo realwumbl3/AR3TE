@@ -13,12 +13,18 @@
     <string name="enable_3dof_view">Enable 3DOF View (Rayneo Air 3S Pro)</string>
     <string name="trackpad_captured">POINTER CAPTURED</string>
     <string name="trackpad_idle">VIRTUAL TRACKPAD</string>
+    <string name="task_switcher_label">Task Switcher</string>
+    <string name="task_switcher_hint">Hold to preview · Swipe ↔ switch · ↑ start (cancel if switched)</string>
+    <string name="task_switcher_position">%1$d / %2$d</string>
+    <string name="task_switcher_apps">%1$d apps</string>
     <string name="three_dof_status">3DOF: %1$s</string>
     <string name="reset_orientation">Reset orientation</string>
     <string name="viz_axis">Viz: Axis</string>
     <string name="viz_glasses">Viz: Glasses</string>
     <string name="reset_orientation_hint">Reset re-zeros HUD. Hold still ~2s on connect for gyro bias calibration.</string>
     <string name="usb_permission_hint">USB permission appears on this phone screen, not the glasses.</string>
-    <string name="stats_text">FPS: %1$d | Bitrate: %2$.2f MB/s</string>
+    <string name="stats_text">FPS: %1$d | Bitrate: %2$.2f MB/s | Latency: %3$s</string>
+    <string name="latency_unknown">--</string>
+    <string name="latency_ms">%1$d ms</string>
     <string name="machine_address">%1$s:%2$d</string>
 </resources>

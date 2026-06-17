@@ -3,7 +3,7 @@ const { performance } = require("perf_hooks");
 const os = require("os");
 const http = require("http");
 const fs = require("fs");
-const { spawn, execSync, execFileSync } = require("child_process");
+const { spawn, execSync, execFileSync, execFile } = require("child_process");
 const path = require("path");
 const { WebSocketServer } = require("ws");
 
@@ -11,6 +11,7 @@ const PORT = 45678;
 const WS_PORT = 45679;
 const DISCOVER_MSG = "AR3TE_DISCOVER";
 const VIDEO_BINARY_TYPE = 1;
+const VIDEO_TIMESTAMP_BYTES = 8;
 const AUDIO_BINARY_TYPE = 2;
 const AUDIO_SAMPLE_RATE = 48000;
 const AUDIO_CHANNELS = 2;
@@ -25,6 +26,7 @@ const PORT_RECLAIM_TIMEOUT_MS = 10000;
 const PORT_RECLAIM_POLL_MS = 200;
 let discoverySocket = null;
 let discoveryBindAttempts = 0;
+let wsBindAttempts = 0;
 
 function getPidsOnPort(port) {
   const pids = new Set();
@@ -35,9 +37,10 @@ function getPidsOnPort(port) {
         encoding: "utf8",
         windowsHide: true,
       });
+      const portPattern = new RegExp(`:${port}(?:\\s|$)`);
       for (const line of output.split(/\r?\n/)) {
         const trimmed = line.trim();
-        if (!trimmed) continue;
+        if (!trimmed || !portPattern.test(trimmed)) continue;
         const pid = trimmed.split(/\s+/).pop();
         if (pid && /^\d+$/.test(pid) && pid !== String(process.pid)) {
           pids.add(pid);
@@ -171,16 +174,92 @@ function killExistingInstances() {
 
 killExistingInstances();
 
-function getLocalIpv4() {
-  const interfaces = os.networkInterfaces();
-  for (const entries of Object.values(interfaces)) {
+const VIRTUAL_INTERFACE_PATTERN =
+  /(virtual|vmware|virtualbox|vethernet|wsl|hyper-v|default switch|host-only|loopback|bluetooth|npcap)/i;
+const APIPA_PATTERN = /^169\.254\./;
+
+function isIPv4Entry(entry) {
+  return entry.family === "IPv4" || entry.family === 4;
+}
+
+function ipv4ToInt(ip) {
+  return ip.split(".").reduce((acc, octet) => (acc << 8) + Number(octet), 0) >>> 0;
+}
+
+function isSameSubnet(ip1, ip2, netmask) {
+  const mask = ipv4ToInt(netmask);
+  return (ipv4ToInt(ip1) & mask) === (ipv4ToInt(ip2) & mask);
+}
+
+function isUsableInterface(name, entry) {
+  if (!isIPv4Entry(entry) || entry.internal) {
+    return false;
+  }
+  if (APIPA_PATTERN.test(entry.address)) {
+    return false;
+  }
+  if (/^192\.168\.56\./.test(entry.address)) {
+    return false;
+  }
+  if (VIRTUAL_INTERFACE_PATTERN.test(name)) {
+    return false;
+  }
+  return true;
+}
+
+function getReachableIpv4Addresses() {
+  const addresses = [];
+  for (const [name, entries] of Object.entries(os.networkInterfaces())) {
     for (const entry of entries) {
-      if (entry.family === "IPv4" && !entry.internal) {
-        return entry.address;
+      if (!isUsableInterface(name, entry)) {
+        continue;
       }
+      addresses.push({
+        name,
+        address: entry.address,
+        netmask: entry.netmask,
+      });
     }
   }
-  return "127.0.0.1";
+  return addresses;
+}
+
+function getHostForClient(clientIp) {
+  const addresses = getReachableIpv4Addresses();
+  for (const entry of addresses) {
+    if (isSameSubnet(entry.address, clientIp, entry.netmask)) {
+      return entry.address;
+    }
+  }
+  return getLocalIpv4();
+}
+
+function getLocalIpv4() {
+  const addresses = getReachableIpv4Addresses();
+  if (addresses.length === 0) {
+    return "127.0.0.1";
+  }
+
+  const scoreAddress = (entry) => {
+    let score = 0;
+    const name = entry.name.toLowerCase();
+    if (/(ethernet|wi-?fi|wlan)/i.test(name)) {
+      score += 20;
+    }
+    if (entry.address.startsWith("10.")) {
+      score += 10;
+    } else if (entry.address.startsWith("192.168.")) {
+      score += 8;
+    } else if (entry.address.startsWith("172.")) {
+      score += 4;
+    }
+    return score;
+  };
+
+  return addresses
+    .slice()
+    .sort((left, right) => scoreAddress(right) - scoreAddress(left))[0]
+    .address;
 }
 
 const machineName = os.hostname();
@@ -195,10 +274,11 @@ function createDiscoverySocket() {
       return;
     }
 
+    const host = getHostForClient(remote.address);
     const payload = JSON.stringify({
       type: "ar3te",
       name: machineName,
-      host: localIp,
+      host,
       port: PORT,
       wsPort: WS_PORT,
     });
@@ -227,10 +307,14 @@ function createDiscoverySocket() {
   socket.on("listening", () => {
     socket.setBroadcast(true);
     discoverySocket = socket;
+    const reachable = getReachableIpv4Addresses().map((entry) => entry.address);
     console.log("AR3TE host server running");
     console.log(`  Machine: ${machineName}`);
     console.log(`  UDP Discovery: ${localIp}:${PORT}`);
     console.log(`  WebSocket Stream: ws://${localIp}:${WS_PORT}`);
+    if (reachable.length > 1) {
+      console.log(`  Reachable IPs: ${reachable.join(", ")}`);
+    }
   });
 
   return socket;
@@ -629,8 +713,8 @@ function resetVideoSendPacer() {
   nextVideoSendAt = 0;
 }
 
-function enqueueVideoFrame(frame) {
-  videoSendQueue.push(frame);
+function enqueueVideoFrame(frame, capturedAtMs = Date.now()) {
+  videoSendQueue.push({ frame, capturedAtMs });
   if (videoSendTimer) {
     return;
   }
@@ -647,9 +731,9 @@ function flushOneVideoFrame() {
   if (videoSendQueue.length === 0) {
     return;
   }
-  const frame = videoSendQueue.shift();
+  const item = videoSendQueue.shift();
   lastVideoSendMs = Date.now();
-  sendBinaryImmediate(frame);
+  sendBinaryImmediate(item.frame, item.capturedAtMs);
 }
 
 function scheduleVideoSend() {
@@ -734,7 +818,13 @@ function notePacingSend(byteLength) {
   }
 }
 
-function sendBinaryImmediate(frame) {
+function buildVideoPayload(frame, capturedAtMs) {
+  const timestamp = Buffer.alloc(VIDEO_TIMESTAMP_BYTES);
+  timestamp.writeBigInt64BE(BigInt(Math.trunc(capturedAtMs)));
+  return Buffer.concat([Buffer.from([VIDEO_BINARY_TYPE]), timestamp, Buffer.from(frame)]);
+}
+
+function sendBinaryImmediate(frame, capturedAtMs) {
   if (!loggedFirstFrame) {
     console.log(`First video payload sent (${frame.length} bytes)`);
     loggedFirstFrame = true;
@@ -742,7 +832,7 @@ function sendBinaryImmediate(frame) {
   if (!wss) {
     return;
   }
-  const payload = Buffer.concat([Buffer.from([VIDEO_BINARY_TYPE]), Buffer.from(frame)]);
+  const payload = buildVideoPayload(frame, capturedAtMs);
   notePacingSend(payload.length);
   wss.clients.forEach((client) => {
     if (client.readyState === 1) { // OPEN
@@ -751,8 +841,8 @@ function sendBinaryImmediate(frame) {
   });
 }
 
-function sendBinary(frame) {
-  enqueueVideoFrame(frame);
+function sendBinary(frame, capturedAtMs) {
+  enqueueVideoFrame(frame, capturedAtMs);
 }
 
 function broadcastText(message) {
@@ -853,10 +943,11 @@ function flushAccessUnit(accessUnit, isKeyframe) {
   }
 
   const frame = Buffer.concat(chunks);
+  const capturedAtMs = Date.now();
   if (isKeyframe) {
-    lastKeyframe = Buffer.concat([Buffer.from([VIDEO_BINARY_TYPE]), frame]);
+    lastKeyframe = buildVideoPayload(frame, capturedAtMs);
   }
-  sendBinary(frame);
+  sendBinary(frame, capturedAtMs);
 }
 
 function handleNalUnit(nal) {
@@ -1497,28 +1588,257 @@ if (!ffmpegPath) {
 startCaptureProcess();
 startAudioCapturePipeline();
 
+function resolveCaptureExe() {
+  const candidates = [
+    path.join(__dirname, "Capture.exe"),
+    path.join(__dirname, "bin", "Release", "net8.0-windows", "Capture.exe"),
+    path.join(__dirname, "bin", "Debug", "net8.0-windows", "Capture.exe"),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function resolveCaptureDll() {
+  const candidates = [
+    path.join(__dirname, "bin", "Release", "net8.0-windows", "Capture.dll"),
+    path.join(__dirname, "bin", "Debug", "net8.0-windows", "Capture.dll"),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function resolveCaptureLaunch(extraArgs = []) {
+  const captureExe = resolveCaptureExe();
+  if (captureExe) {
+    return { command: captureExe, args: extraArgs };
+  }
+  const captureDll = resolveCaptureDll();
+  if (captureDll) {
+    return { command: "dotnet", args: [captureDll, ...extraArgs] };
+  }
+  return null;
+}
+
+let lastKnownTaskCount = null;
+let lastTaskCountRequestMs = 0;
+let lastPowerShellTaskCountMs = 0;
+const TASK_COUNT_POLL_MS = 5000;
+const TASK_COUNT_MIN_REQUEST_MS = 2000;
+const TASK_COUNT_POWERSHELL_MIN_MS = 60000;
+const TASK_COUNT_PROBE_MAX_BUFFER = 16 * 1024;
+
+function handleInputStderr(data) {
+  const text = data.toString();
+  const match = text.match(/TASK_COUNT:(\d+)/);
+  if (!match) {
+    if (text.trim() && !text.includes("Input loop started")) {
+      process.stderr.write(`[input] ${text}`);
+    }
+    return;
+  }
+  const count = Number.parseInt(match[1], 10);
+  if (!Number.isInteger(count) || count < 1) {
+    return;
+  }
+  lastKnownTaskCount = count;
+  broadcastTaskCount(count);
+}
+
+function requestInputTaskCount(force = false) {
+  const now = Date.now();
+  if (!force && now - lastTaskCountRequestMs < TASK_COUNT_MIN_REQUEST_MS) {
+    return;
+  }
+  lastTaskCountRequestMs = now;
+  if (inputProcess && !inputProcess.killed) {
+    inputProcess.stdin.write("tc\n");
+  }
+}
+
+function queryTaskCountPowerShellAsync(onDone = () => {}) {
+  const now = Date.now();
+  if (now - lastPowerShellTaskCountMs < TASK_COUNT_POWERSHELL_MIN_MS) {
+    onDone(lastKnownTaskCount);
+    return;
+  }
+  lastPowerShellTaskCountMs = now;
+  execFile(
+    "powershell",
+    [
+      "-NoProfile",
+      "-Command",
+      "(Get-Process | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero -and $_.MainWindowTitle } | Measure-Object).Count",
+    ],
+    {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 5000,
+      maxBuffer: TASK_COUNT_PROBE_MAX_BUFFER,
+    },
+    (error, stdout) => {
+      if (error) {
+        if (error.message && !error.message.includes("maxBuffer")) {
+          console.warn("task_count powershell query failed:", error.message);
+        }
+        onDone(lastKnownTaskCount);
+        return;
+      }
+      const count = Number.parseInt(String(stdout).trim(), 10);
+      if (Number.isFinite(count) && count > 0) {
+        broadcastTaskCount(count);
+        onDone(count);
+        return;
+      }
+      onDone(lastKnownTaskCount);
+    }
+  );
+}
+
+function maybePowerShellTaskCountFallback() {
+  if (lastKnownTaskCount != null) {
+    return;
+  }
+  queryTaskCountPowerShellAsync();
+}
+
+function refreshTaskCount() {
+  requestInputTaskCount();
+  if (lastKnownTaskCount != null) {
+    broadcastTaskCount(lastKnownTaskCount);
+  }
+}
+
+function sendTaskCountToClient(ws) {
+  if (lastKnownTaskCount != null && ws.readyState === 1) {
+    ws.send(JSON.stringify({ type: "task_count", count: lastKnownTaskCount }));
+  }
+}
+
+function writeInput(line) {
+  if (inputProcess && !inputProcess.killed) {
+    inputProcess.stdin.write(line);
+  }
+}
+
+function handleTaskSwitcher(action, steps = 0) {
+  if (!inputProcess || inputProcess.killed) {
+    return;
+  }
+  switch (action) {
+    case "open":
+      writeInput("kd 18\n");
+      writeInput("kd 9\n");
+      writeInput("ku 9\n");
+      break;
+    case "step": {
+      if (!Number.isInteger(steps) || steps === 0) {
+        break;
+      }
+      const count = Math.abs(steps);
+      const backward = steps < 0;
+      for (let i = 0; i < count; i += 1) {
+        if (backward) {
+          writeInput("kd 16\n");
+          writeInput("kd 9\n");
+          writeInput("ku 9\n");
+          writeInput("ku 16\n");
+        } else {
+          writeInput("kd 9\n");
+          writeInput("ku 9\n");
+        }
+      }
+      break;
+    }
+    case "commit":
+      writeInput("ku 18\n");
+      break;
+    case "cancel":
+      writeInput("kd 27\n");
+      writeInput("ku 27\n");
+      writeInput("ku 18\n");
+      break;
+    case "dismiss":
+      writeInput("kd 36\n");
+      writeInput("ku 36\n");
+      writeInput("ku 18\n");
+      break;
+    case "start_menu":
+      writeInput("ku 18\n");
+      setTimeout(() => {
+        writeInput("kd 91\n");
+        writeInput("ku 91\n");
+      }, 100);
+      break;
+    default:
+      break;
+  }
+}
+
+function broadcastTaskCount(count) {
+  if (count == null || count < 1 || !wss) {
+    return;
+  }
+  lastKnownTaskCount = count;
+  const message = JSON.stringify({ type: "task_count", count });
+  for (const client of wss.clients) {
+    if (client.readyState === 1) {
+      client.send(message);
+    }
+  }
+}
+
+let taskCountPollTimer = null;
+
+function startTaskCountPolling() {
+  if (taskCountPollTimer) {
+    return;
+  }
+  taskCountPollTimer = setInterval(() => {
+    if (!wss || wss.clients.size === 0) {
+      clearInterval(taskCountPollTimer);
+      taskCountPollTimer = null;
+      return;
+    }
+    refreshTaskCount();
+  }, TASK_COUNT_POLL_MS);
+}
+
+function stopTaskCountPollingIfIdle() {
+  if (wss && wss.clients.size === 0 && taskCountPollTimer) {
+    clearInterval(taskCountPollTimer);
+    taskCountPollTimer = null;
+  }
+}
+
 function startInputProcess() {
   if (shuttingDown) return;
-  const captureExe = path.join(__dirname, "Capture.exe");
-  if (!fs.existsSync(captureExe)) {
-    console.error(`Input handler error: ${captureExe} not found. Please build Capture.exe`);
+  const launch = resolveCaptureLaunch(["--input"]);
+  if (!launch) {
+    console.error("Input handler error: Capture.exe not found. Please build Capture.exe");
     return;
   }
   console.log("Starting input handler process");
   try {
-    inputProcess = spawn(captureExe, ["--input"], { stdio: ["pipe", "ignore", "pipe"] });
+    inputProcess = spawn(launch.command, launch.args, { stdio: ["pipe", "ignore", "pipe"] });
     inputProcess.on("error", (err) => {
       console.error("Failed to start input process:", err);
     });
-    inputProcess.stderr.on("data", (data) => {
-      process.stderr.write(`[input] ${data}`);
-    });
+    inputProcess.stderr.on("data", handleInputStderr);
     inputProcess.on("exit", (code) => {
       if (!shuttingDown) {
         console.log(`Input handler exited (code ${code}), restarting...`);
         setTimeout(startInputProcess, 2000);
       }
     });
+    setTimeout(() => requestInputTaskCount(true), 500);
   } catch (err) {
     console.error("Error spawning input process:", err);
   }
@@ -1557,6 +1877,10 @@ wss.on("connection", (ws) => {
   if (lastCursorMessage) {
     ws.send(lastCursorMessage);
   }
+  broadcastTaskCount(lastKnownTaskCount);
+  requestInputTaskCount(true);
+  setTimeout(maybePowerShellTaskCountFallback, 3000);
+  startTaskCountPolling();
 
   ws.on("message", (message) => {
     try {
@@ -1598,27 +1922,78 @@ wss.on("connection", (ws) => {
       } else if (data.type === "mouse_wheel") {
         inputProcess?.stdin.write(`mw ${Math.round(data.delta)}\n`);
       } else if (data.type === "key_down") {
+        if (data.alt) inputProcess?.stdin.write(`kd 18\n`);
         if (data.shift) inputProcess?.stdin.write(`kd 16\n`);
         inputProcess?.stdin.write(`kd ${data.vk}\n`);
       } else if (data.type === "key_up") {
         inputProcess?.stdin.write(`ku ${data.vk}\n`);
         if (data.shift) inputProcess?.stdin.write(`ku 16\n`);
+        if (data.alt) inputProcess?.stdin.write(`ku 18\n`);
+      } else if (data.type === "task_switcher") {
+        handleTaskSwitcher(data.action, data.steps);
+      } else if (data.type === "request_task_count") {
+        refreshTaskCount();
+        sendTaskCountToClient(ws);
+      } else if (data.type === "ping") {
+        ws.send(JSON.stringify({
+          type: "pong",
+          id: data.id,
+          t: data.t,
+          server_now: Date.now(),
+        }));
       }
     } catch (e) {}
   });
 
   ws.on("close", () => {
     console.log("Client disconnected");
+    stopTaskCountPollingIfIdle();
   });
 });
 
-server.listen(WS_PORT);
+function bindWebSocketServer() {
+  wsBindAttempts += 1;
+  if (!waitForPortsToBeFree([WS_PORT], 2000)) {
+    killExistingInstances();
+  }
+  server.listen(WS_PORT);
+}
+
+server.on("error", (error) => {
+  if (error.code === "EADDRINUSE" && wsBindAttempts < 5) {
+    console.warn(`Port ${WS_PORT} is busy, retrying WebSocket bind...`);
+    killExistingInstances();
+    try {
+      server.close();
+    } catch {
+      // Server may already be closing or closed.
+    }
+    const retryDelay = Math.min(1000, 200 * wsBindAttempts);
+    setTimeout(bindWebSocketServer, retryDelay);
+    return;
+  }
+
+  console.error(error.code === "EADDRINUSE" ? `Port ${WS_PORT} is already in use.` : error);
+  process.exit(1);
+});
+
+bindWebSocketServer();
 
 function shutdown() {
   shuttingDown = true;
   stopCaptureProcess();
   stopAudioCaptureProcess();
   stopInputProcess();
+  try {
+    discoverySocket?.close();
+  } catch {
+    // Socket may already be closed.
+  }
+  try {
+    server.close();
+  } catch {
+    // Server may already be closed.
+  }
   process.exit(0);
 }
 

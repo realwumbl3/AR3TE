@@ -77,6 +77,33 @@ namespace RemoteDesktop {
         [DllImport("user32.dll")]
         private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo);
 
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+
+        [DllImport("user32.dll")]
+        private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll")]
+        private static extern int GetWindowTextLength(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsIconic(IntPtr hWnd);
+
+        private const int GWL_STYLE = -16;
+        private const int GWL_EXSTYLE = -20;
+        private const int WS_CHILD = unchecked((int)0x40000000);
+        private const uint WS_EX_TOOLWINDOW = 0x00000080;
+        private const uint WS_EX_APPWINDOW = 0x00040000;
+        private const uint GW_OWNER = 4;
+
         [StructLayout(LayoutKind.Sequential)]
         private struct RECT {
             public int Left, Top, Right, Bottom;
@@ -234,6 +261,96 @@ namespace RemoteDesktop {
             };
         }
 
+        private static bool IsAltTabWindow(IntPtr hWnd) {
+            if (!IsWindowVisible(hWnd) && !IsIconic(hWnd)) {
+                return false;
+            }
+
+            int style = GetWindowLong(hWnd, GWL_STYLE);
+            if ((style & WS_CHILD) != 0) {
+                return false;
+            }
+
+            int exStyle = GetWindowLong(hWnd, GWL_EXSTYLE);
+            if ((exStyle & (int)WS_EX_TOOLWINDOW) != 0 && (exStyle & (int)WS_EX_APPWINDOW) == 0) {
+                return false;
+            }
+
+            IntPtr owner = GetWindow(hWnd, GW_OWNER);
+            if (owner != IntPtr.Zero && (exStyle & (int)WS_EX_APPWINDOW) == 0) {
+                return false;
+            }
+
+            if (GetWindowTextLength(hWnd) == 0 && (exStyle & (int)WS_EX_APPWINDOW) == 0) {
+                return false;
+            }
+            return true;
+        }
+
+        private static int CountAltTabWindows() {
+            int count = 0;
+            EnumWindows((hWnd, lParam) => {
+                if (IsAltTabWindow(hWnd)) {
+                    count++;
+                }
+                return true;
+            }, IntPtr.Zero);
+            return count;
+        }
+
+        private const byte VK_MENU = 0x12;
+        private const byte VK_TAB = 0x09;
+        private const byte VK_SHIFT = 0x10;
+        private const byte VK_ESCAPE = 0x1B;
+        private const byte VK_HOME = 0x24;
+        private const byte VK_LWIN = 0x5B;
+
+        private static void TapKey(byte vk) {
+            keybd_event(vk, 0, 0, 0);
+            keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
+        }
+
+        private static void TaskSwitcherOpen() {
+            keybd_event(VK_MENU, 0, 0, 0);
+            TapKey(VK_TAB);
+        }
+
+        private static void TaskSwitcherStep(int steps) {
+            if (steps == 0) {
+                return;
+            }
+            bool backward = steps < 0;
+            int count = Math.Abs(steps);
+            for (int i = 0; i < count; i++) {
+                if (backward) {
+                    keybd_event(VK_SHIFT, 0, 0, 0);
+                    TapKey(VK_TAB);
+                    keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0);
+                } else {
+                    TapKey(VK_TAB);
+                }
+            }
+        }
+
+        private static void TaskSwitcherCommit() {
+            keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+        }
+
+        private static void TaskSwitcherCancel() {
+            TapKey(VK_ESCAPE);
+            keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+        }
+
+        private static void TaskSwitcherDismiss() {
+            TapKey(VK_HOME);
+            keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+        }
+
+        private static void TaskSwitcherStartMenu() {
+            keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+            TapKey(VK_LWIN);
+        }
+
         private static void RunInputLoop() {
             Console.Error.WriteLine("Input loop started");
             Console.Error.Flush();
@@ -293,6 +410,36 @@ namespace RemoteDesktop {
                                 keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
                             }
                             break;
+                        case "tc":
+                            Console.Error.WriteLine("TASK_COUNT:" + CountAltTabWindows());
+                            Console.Error.Flush();
+                            break;
+                        case "ts":
+                            if (parts.Length >= 2) {
+                                switch (parts[1]) {
+                                    case "open":
+                                        TaskSwitcherOpen();
+                                        break;
+                                    case "commit":
+                                        TaskSwitcherCommit();
+                                        break;
+                                    case "cancel":
+                                        TaskSwitcherCancel();
+                                        break;
+                                    case "dismiss":
+                                        TaskSwitcherDismiss();
+                                        break;
+                                    case "start":
+                                        TaskSwitcherStartMenu();
+                                        break;
+                                    case "step":
+                                        if (parts.Length >= 3) {
+                                            TaskSwitcherStep(int.Parse(parts[2]));
+                                        }
+                                        break;
+                                }
+                            }
+                            break;
                     }
                 } catch (Exception ex) {
                     Console.Error.WriteLine("Input error: " + ex.Message);
@@ -304,6 +451,7 @@ namespace RemoteDesktop {
             EnableDpiAwareness();
 
             bool probeOnly = false;
+            bool taskCountOnly = false;
             bool inputOnly = false;
 
             for (int i = 0; i < args.Length; i++) {
@@ -311,6 +459,8 @@ namespace RemoteDesktop {
                     continue;
                 } else if (args[i] == "--probe") {
                     probeOnly = true;
+                } else if (args[i] == "--task-count") {
+                    taskCountOnly = true;
                 } else if (args[i] == "--input") {
                     inputOnly = true;
                 } else if (args[i] == "--cursor-only") {
@@ -349,6 +499,11 @@ namespace RemoteDesktop {
                     + $"\"height\":{probe.Bounds.Height}"
                     + "}"
                 );
+                return;
+            }
+
+            if (taskCountOnly) {
+                Console.Out.WriteLine("{\"count\":" + CountAltTabWindows() + "}");
                 return;
             }
 

@@ -9,6 +9,7 @@ import android.hardware.display.DisplayManager
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LifecycleService
 import androidx.compose.runtime.getValue
@@ -21,6 +22,7 @@ class ExternalDisplayService : LifecycleService() {
 
     private var presentation: ExternalDisplayPresentation? = null
     private lateinit var displayManager: DisplayManager
+    private var wakeLock: PowerManager.WakeLock? = null
     
     private var _currentState by mutableStateOf(ExternalDisplayState.IDLE)
     var currentState: ExternalDisplayState
@@ -36,7 +38,24 @@ class ExternalDisplayService : LifecycleService() {
         set(value) {
             _activeMachine = value
             presentation?.activeMachine = value
+            updateWakeLock(value != null)
         }
+
+    private fun updateWakeLock(acquire: Boolean) {
+        if (acquire) {
+            if (wakeLock == null) {
+                val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+                wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AR3TE:StreamingWakeLock")
+            }
+            if (wakeLock?.isHeld == false) {
+                wakeLock?.acquire()
+            }
+        } else {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+            }
+        }
+    }
 
     private var _monitorIndex by mutableIntStateOf(1)
     var monitorIndex: Int
@@ -68,6 +87,13 @@ class ExternalDisplayService : LifecycleService() {
             _currentMegabytesPerSecond = value
         }
 
+    private var _currentLatencyMs by mutableIntStateOf(-1)
+    var currentLatencyMs: Int
+        get() = _currentLatencyMs
+        private set(value) {
+            _currentLatencyMs = value
+        }
+
     private var _currentCaptureMethod by mutableStateOf("Loading...")
     var currentCaptureMethod: String
         get() = _currentCaptureMethod
@@ -81,6 +107,15 @@ class ExternalDisplayService : LifecycleService() {
         private set(value) {
             _currentAudioState = value
         }
+
+    private var _openTaskCount by mutableIntStateOf(0)
+    var openTaskCount: Int
+        get() = _openTaskCount
+        private set(value) {
+            _openTaskCount = value
+        }
+
+    var taskCountListener: ((Int) -> Unit)? = null
 
     var localCursorX by mutableStateOf(0f)
     var localCursorY by mutableStateOf(0f)
@@ -165,9 +200,10 @@ class ExternalDisplayService : LifecycleService() {
                     is3DofEnabled = _is3DofEnabled
                     localCursorX = this@ExternalDisplayService.localCursorX
                     localCursorY = this@ExternalDisplayService.localCursorY
-                    onStatsUpdated = { f, megabytesPerSecond, method ->
+                    onStatsUpdated = { f, megabytesPerSecond, method, latencyMs ->
                         currentFps = f
                         currentMegabytesPerSecond = megabytesPerSecond
+                        currentLatencyMs = latencyMs
                         if (!method.isNullOrBlank()) {
                             currentCaptureMethod = method
                         }
@@ -177,6 +213,10 @@ class ExternalDisplayService : LifecycleService() {
                     }
                     onAudioStateUpdated = { state ->
                         currentAudioState = state
+                    }
+                    onTaskCountUpdated = { count ->
+                        openTaskCount = count
+                        taskCountListener?.invoke(count)
                     }
                     onRemoteCursorReceived = { x, y, w, h ->
                         syncLocalCursorFromRemote(x, y, w, h)
@@ -211,6 +251,7 @@ class ExternalDisplayService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        updateWakeLock(false)
         displayManager.unregisterDisplayListener(displayListener)
         presentation?.dismiss()
         presentation = null

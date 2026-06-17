@@ -93,6 +93,8 @@ enum class ExternalDisplayState {
 
 private const val REMOTE_TAG = "RemoteScreenView"
 private const val H264_TAG = "H264StreamController"
+private const val VIDEO_TIMESTAMP_BYTES = 8
+private const val VIDEO_HEADER_BYTES = 1 + VIDEO_TIMESTAMP_BYTES
 private const val ENABLE_DEBUG_LOGS = false
 
 private fun debugLog(tag: String, message: String) {
@@ -111,6 +113,23 @@ private fun debugError(tag: String, message: String, error: Throwable? = null) {
         Log.e(tag, message)
         println("$tag: $message")
     }
+}
+
+private fun parseTimestampedVideoPacket(data: ByteArray): Pair<ByteArray, Long?> {
+    if (data.size <= VIDEO_HEADER_BYTES) {
+        return data.copyOfRange(1, data.size) to null
+    }
+    val captureMs = ByteBuffer.wrap(data, 1, VIDEO_TIMESTAMP_BYTES).long
+    if (!isPlausibleWallClockMs(captureMs)) {
+        return data.copyOfRange(1, data.size) to null
+    }
+    val payload = data.copyOfRange(VIDEO_HEADER_BYTES, data.size)
+    return payload to captureMs
+}
+
+private fun isPlausibleWallClockMs(value: Long): Boolean {
+    // Reject H.264 start codes and other garbage; accept real epoch-ms timestamps (~2020+).
+    return value >= 1_577_836_800_000L
 }
 
 data class RemoteCursorState(
@@ -163,9 +182,10 @@ class ExternalDisplayPresentation(
     var activeMachine by mutableStateOf<DiscoveredMachine?>(null)
     var monitorIndex by mutableIntStateOf(1)
     var is3DofEnabled by mutableStateOf(false)
-    var onStatsUpdated: ((Int, Double, String?) -> Unit)? = null
+    var onStatsUpdated: ((Int, Double, String?, Int) -> Unit)? = null
     var onCaptureMethodUpdated: ((String) -> Unit)? = null
     var onAudioStateUpdated: ((String) -> Unit)? = null
+    var onTaskCountUpdated: ((Int) -> Unit)? = null
     var onSendMessage: ((String) -> Unit)? = null
     var onRemoteCursorReceived: ((Float, Float, Int, Int) -> Unit)? = null
     
@@ -197,6 +217,7 @@ class ExternalDisplayPresentation(
                     onStatsUpdated, 
                     onCaptureMethodUpdated, 
                     onAudioStateUpdated,
+                    onTaskCountUpdated,
                     { onSendMessage = it },
                     { x, y, w, h -> onRemoteCursorReceived?.invoke(x, y, w, h) },
                     localCursorX,
@@ -225,9 +246,10 @@ fun ExternalDisplayScreen(
     machine: DiscoveredMachine? = null,
     monitorIndex: Int = 1,
     is3DofEnabled: Boolean = false,
-    onStatsUpdated: ((Int, Double, String?) -> Unit)? = null,
+    onStatsUpdated: ((Int, Double, String?, Int) -> Unit)? = null,
     onCaptureMethodUpdated: ((String) -> Unit)? = null,
     onAudioStateUpdated: ((String) -> Unit)? = null,
+    onTaskCountUpdated: ((Int) -> Unit)? = null,
     onClientReady: ((String) -> Unit) -> Unit = {},
     onRemoteCursorReceived: (Float, Float, Int, Int) -> Unit = { _, _, _, _ -> },
     localCursorX: Float = 0f,
@@ -243,6 +265,7 @@ fun ExternalDisplayScreen(
                 onStatsUpdated, 
                 onCaptureMethodUpdated, 
                 onAudioStateUpdated,
+                onTaskCountUpdated,
                 onClientReady, 
                 onRemoteCursorReceived,
                 localCursorX,
@@ -281,9 +304,10 @@ fun RemoteScreenView(
     machine: DiscoveredMachine?,
     monitorIndex: Int,
     is3DofEnabled: Boolean,
-    onStatsUpdated: ((Int, Double, String?) -> Unit)? = null,
+    onStatsUpdated: ((Int, Double, String?, Int) -> Unit)? = null,
     onCaptureMethodUpdated: ((String) -> Unit)? = null,
     onAudioStateUpdated: ((String) -> Unit)? = null,
+    onTaskCountUpdated: ((Int) -> Unit)? = null,
     onClientReady: ((String) -> Unit) -> Unit = {},
     onRemoteCursorReceived: (Float, Float, Int, Int) -> Unit = { _, _, _, _ -> },
     localCursorX: Float = 0f,
@@ -327,19 +351,54 @@ fun RemoteScreenView(
 
             var frameCount = 0
             var byteCount = 0L
+            var latencyEma = 0.0
+            var hasLatency = false
+            var clockOffsetMs = 0L
+            var hasClockOffset = false
+            val pendingPings = mutableMapOf<Long, Long>()
 
             val statsJob = scope.launch(Dispatchers.Default) {
                 while (isActive) {
                     kotlinx.coroutines.delay(1000)
                     val fps = frameCount
                     val megabytesPerSecond = byteCount / (1024.0 * 1024.0)
+                    val latencyMs = if (hasLatency) latencyEma.roundToInt() else -1
                     withContext(Dispatchers.Main) {
-                        onStatsUpdated?.invoke(fps, megabytesPerSecond, captureMethod)
+                        onStatsUpdated?.invoke(fps, megabytesPerSecond, captureMethod, latencyMs)
                     }
-                    debugLog(REMOTE_TAG, "Stream stats: fps=$fps MBps=$megabytesPerSecond")
+                    debugLog(REMOTE_TAG, "Stream stats: fps=$fps MBps=$megabytesPerSecond latencyMs=$latencyMs")
                     frameCount = 0
                     byteCount = 0
                 }
+            }
+
+            val pingJob = scope.launch(Dispatchers.Default) {
+                var pingId = 0L
+                while (isActive) {
+                    kotlinx.coroutines.delay(2000)
+                    val client = client
+                    if (client?.isOpen != true) {
+                        continue
+                    }
+                    val sentAt = System.currentTimeMillis()
+                    pingId += 1
+                    pendingPings[pingId] = sentAt
+                    client.send(JSONObject().apply {
+                        put("type", "ping")
+                        put("id", pingId)
+                        put("t", sentAt)
+                    }.toString())
+                }
+            }
+
+            decoderController.clockOffsetMs = { clockOffsetMs }
+            decoderController.onLatencySample = { sample ->
+                latencyEma = if (!hasLatency) {
+                    sample
+                } else {
+                    latencyEma * 0.85 + sample * 0.15
+                }
+                hasLatency = true
             }
 
             val uri = URI("ws://${machine.host}:${machine.wsPort}")
@@ -349,6 +408,13 @@ fun RemoteScreenView(
                     send(JSONObject().apply {
                         put("type", "set_monitor")
                         put("value", monitorIndex)
+                    }.toString())
+                    val sentAt = System.currentTimeMillis()
+                    pendingPings[1L] = sentAt
+                    send(JSONObject().apply {
+                        put("type", "ping")
+                        put("id", 1L)
+                        put("t", sentAt)
                     }.toString())
                 }
 
@@ -360,11 +426,17 @@ fun RemoteScreenView(
                             "stream_reset" -> {
                                 val resetMonitor = json.optInt("monitor", monitorIndex)
                                 debugLog(REMOTE_TAG, "stream_reset received for monitor $resetMonitor")
+                                hasLatency = false
+                                latencyEma = 0.0
+                                hasClockOffset = false
+                                clockOffsetMs = 0L
+                                pendingPings.clear()
                                 scope.launch(Dispatchers.Main) {
                                     videoConfig = null
                                     captureMethod = null
                                     cursor = null
                                     decoderController.resetStream()
+                                    onStatsUpdated?.invoke(0, 0.0, captureMethod, -1)
                                 }
                             }
                             "capture_status" -> {
@@ -376,12 +448,36 @@ fun RemoteScreenView(
                                     }
                                 }
                             }
+                            "task_count" -> {
+                                val count = json.optInt("count", 0)
+                                if (count > 0) {
+                                    scope.launch(Dispatchers.Main) {
+                                        onTaskCountUpdated?.invoke(count)
+                                    }
+                                }
+                            }
                             "audio_reset" -> {
                                 debugLog(REMOTE_TAG, "audio_reset received")
                                 scope.launch(Dispatchers.Main) {
                                     audioController.resetStream()
                                     onAudioStateUpdated?.invoke("Desktop audio reconnecting")
                                 }
+                            }
+                            "pong" -> {
+                                val pingId = json.optLong("id", -1)
+                                val sentAt = pendingPings.remove(pingId) ?: return
+                                val serverNow = json.optLong("server_now", -1)
+                                if (serverNow < 0L) {
+                                    return
+                                }
+                                val rtt = (System.currentTimeMillis() - sentAt).coerceAtLeast(0L)
+                                val offsetEstimate = serverNow - sentAt - (rtt / 2)
+                                clockOffsetMs = if (!hasClockOffset) {
+                                    offsetEstimate
+                                } else {
+                                    ((clockOffsetMs * 3) + offsetEstimate) / 4
+                                }
+                                hasClockOffset = true
                             }
                             "audio_status" -> {
                                 val state = json.optString("state", "unknown")
@@ -489,13 +585,14 @@ fun RemoteScreenView(
                         if (data.isNotEmpty()) {
                             when (data[0].toInt() and 0xff) {
                                 1 -> {
-                                    val payload = data.copyOfRange(1, data.size)
+                                    val (payload, captureMs) = parseTimestampedVideoPacket(data)
                                     byteCount += payload.size
                                     frameCount++
-                                    if (frameCount == 1) {
-                                        debugLog(REMOTE_TAG, "First video payload received: ${payload.size} bytes")
+                                    if (captureMs != null) {
+                                        decoderController.queueFrame(payload, captureMs)
+                                    } else {
+                                        decoderController.queueFrame(payload)
                                     }
-                                    decoderController.queueFrame(payload)
                                 }
                                 2 -> {
                                     val payload = data.copyOfRange(1, data.size)
@@ -530,9 +627,11 @@ fun RemoteScreenView(
                 debugLog(REMOTE_TAG, "Disconnecting")
                 wsClient.close()
                 statsJob.cancel()
+                pingJob.cancel()
                 decoderController.release()
                 audioController.release()
                 client = null
+                onStatsUpdated?.invoke(0, 0.0, null, -1)
             }
         }
     }
@@ -567,6 +666,7 @@ fun RemoteScreenView(
                     AndroidView(
                         factory = { context ->
                             SurfaceView(context).apply {
+                                keepScreenOn = true
                                 holder.addCallback(decoderController)
                                 decoderController.bindSurface(holder)
                             }
@@ -977,8 +1077,10 @@ data class H264StreamConfig(
 class H264StreamController(
     private val scope: kotlinx.coroutines.CoroutineScope
 ) : SurfaceHolder.Callback {
-    private val frameQueue = Channel<ByteArray>(Channel.UNLIMITED)
-    private val pendingFrames = ArrayDeque<ByteArray>()
+    private data class TimestampedFrame(val data: ByteArray, val captureMs: Long?)
+    private val frameQueue = Channel<TimestampedFrame>(Channel.UNLIMITED)
+    private val pendingFrames = ArrayDeque<TimestampedFrame>()
+    private val inflightCaptureTimes = ArrayDeque<Long?>()
     private val codecLock = Any()
     private val outputLock = Any()
     private val readyOutputs = ArrayDeque<ReadyOutput>()
@@ -1001,6 +1103,8 @@ class H264StreamController(
     private var renderGapMinMs = Double.POSITIVE_INFINITY
     private var renderGapCount = 0
     private var lastRenderMs = 0L
+    var clockOffsetMs: () -> Long = { 0L }
+    var onLatencySample: ((Double) -> Unit)? = null
 
     fun configure(config: H264StreamConfig) {
         debugLog(H264_TAG, "configure: ${config.width}x${config.height} fps=${config.fps} encoder=${config.encoder}")
@@ -1016,7 +1120,7 @@ class H264StreamController(
         maybeStartCodec()
     }
 
-    fun queueFrame(frame: ByteArray) {
+    fun queueFrame(frame: ByteArray, captureMs: Long? = null) {
         if (waitingForKeyframe && !containsIdr(frame)) {
             return
         }
@@ -1024,7 +1128,7 @@ class H264StreamController(
             waitingForKeyframe = false
             debugLog(H264_TAG, "Keyframe received, starting decode queue")
         }
-        frameQueue.trySend(frame)
+        frameQueue.trySend(TimestampedFrame(frame, captureMs))
     }
 
     fun bindSurface(holder: SurfaceHolder) {
@@ -1068,6 +1172,7 @@ class H264StreamController(
         synchronized(codecLock) {
             pendingConfig = null
             waitingForKeyframe = true
+            inflightCaptureTimes.clear()
         }
         stopCodec()
     }
@@ -1118,10 +1223,10 @@ class H264StreamController(
             inputJob?.cancel()
             inputJob = scope.launch(Dispatchers.Default) {
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY)
-                for (frame in frameQueue) {
+                for (item in frameQueue) {
                     if (!isActive || !isCurrentCodec(decoder)) break
                     synchronized(codecLock) {
-                        pendingFrames.addLast(frame)
+                        pendingFrames.addLast(item)
                     }
                     feedQueuedFrames(decoder)
                 }
@@ -1158,19 +1263,29 @@ class H264StreamController(
             }
 
             inputBuffer.clear()
-            inputBuffer.put(frame)
+            inputBuffer.put(frame.data)
             val ptsUs = synchronized(codecLock) {
                 val pts = nextPtsUs
                 nextPtsUs += frameDurationUs
                 pts
             }
-            decoder.queueInputBuffer(inputIndex, 0, frame.size, ptsUs, 0)
+            synchronized(codecLock) {
+                inflightCaptureTimes.addLast(frame.captureMs)
+            }
+            decoder.queueInputBuffer(inputIndex, 0, frame.data.size, ptsUs, 0)
         }
     }
 
     private fun enqueueReadyOutput(bufferIndex: Int) {
+        val captureMs = synchronized(codecLock) {
+            if (inflightCaptureTimes.isEmpty()) {
+                null
+            } else {
+                inflightCaptureTimes.removeFirst()
+            }
+        }
         synchronized(outputLock) {
-            readyOutputs.addLast(ReadyOutput(bufferIndex))
+            readyOutputs.addLast(ReadyOutput(bufferIndex, captureMs))
         }
         requestVsyncRelease()
     }
@@ -1208,7 +1323,7 @@ class H264StreamController(
         }
 
         outputs.forEachIndexed { index, ready ->
-            noteRender()
+            noteRender(ready.captureMs)
             val presentTimeNs = if (index == 0 && outputs.size == 1) {
                 frameTimeNanos
             } else {
@@ -1270,7 +1385,11 @@ class H264StreamController(
         return rendered
     }
 
-    private fun noteRender() {
+    private fun noteRender(captureMs: Long?) {
+        captureMs?.let {
+            val sample = (System.currentTimeMillis() + clockOffsetMs() - it).toDouble().coerceAtLeast(0.0)
+            onLatencySample?.invoke(sample)
+        }
         if (!ENABLE_DEBUG_LOGS) {
             return
         }
@@ -1317,6 +1436,7 @@ class H264StreamController(
             val current = codec
             codec = null
             pendingFrames.clear()
+            inflightCaptureTimes.clear()
             nextPtsUs = 0L
             waitingForKeyframe = true
             resetRenderStats()
@@ -1366,7 +1486,7 @@ class H264StreamController(
         return false
     }
 
-    private data class ReadyOutput(val bufferIndex: Int)
+    private data class ReadyOutput(val bufferIndex: Int, val captureMs: Long? = null)
 
     companion object {
         private const val MAX_READY_FRAMES = 2

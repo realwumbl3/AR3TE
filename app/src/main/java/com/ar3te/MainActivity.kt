@@ -19,10 +19,17 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.input.pointer.changedToUp
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.ui.draw.clip
 import kotlin.math.abs
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -62,9 +69,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -92,6 +102,7 @@ class MainActivity : ComponentActivity() {
     private var activeMachine by mutableStateOf<DiscoveredMachine?>(null)
     private var isPointerCaptured by mutableStateOf(false)
     private var is3DofEnabled by mutableStateOf(false)
+    private var openTaskCount by mutableIntStateOf(0)
 
     private lateinit var machineDiscovery: MachineDiscovery
 
@@ -105,10 +116,15 @@ class MainActivity : ComponentActivity() {
             srv.activeMachine?.let {
                 activeMachine = it
             }
+            srv.taskCountListener = { count ->
+                openTaskCount = count
+            }
+            openTaskCount = srv.openTaskCount
         }
 
         override fun onServiceDisconnected(arg0: ComponentName) {
             isBound = false
+            externalDisplayService?.taskCountListener = null
             externalDisplayService = null
         }
     }
@@ -157,6 +173,10 @@ class MainActivity : ComponentActivity() {
                                 activeMachine = it
                                 externalDisplayService?.activeMachine = it
                                 externalDisplayService?.currentState = ExternalDisplayState.REMOTE_SCREEN
+                                externalDisplayService?.let { srv ->
+                                    srv.taskCountListener = { count -> openTaskCount = count }
+                                    openTaskCount = srv.openTaskCount
+                                }
                             },
                             modifier = Modifier.padding(innerPadding).imePadding()
                         )
@@ -165,8 +185,10 @@ class MainActivity : ComponentActivity() {
                             machine = machine,
                             currentFps = externalDisplayService?.currentFps ?: 0,
                             currentMegabytesPerSecond = externalDisplayService?.currentMegabytesPerSecond ?: 0.0,
+                            currentLatencyMs = externalDisplayService?.currentLatencyMs ?: -1,
                             currentCaptureMethod = externalDisplayService?.currentCaptureMethod ?: stringResource(R.string.loading),
                             currentAudioState = externalDisplayService?.currentAudioState ?: stringResource(R.string.loading),
+                            openTaskCount = openTaskCount,
                             isPointerCaptured = isPointerCaptured,
                             is3DofEnabled = is3DofEnabled,
                             onStop = { 
@@ -423,8 +445,10 @@ fun ScreenSharingScreen(
     machine: DiscoveredMachine,
     currentFps: Int,
     currentMegabytesPerSecond: Double,
+    currentLatencyMs: Int,
     currentCaptureMethod: String,
     currentAudioState: String,
+    openTaskCount: Int,
     isPointerCaptured: Boolean,
     is3DofEnabled: Boolean,
     onStop: () -> Unit,
@@ -446,7 +470,23 @@ fun ScreenSharingScreen(
     val haptic = LocalHapticFeedback.current
     val currentCapturedMouseEvent by rememberUpdatedState(onCapturedMouseEvent)
 
+    DisposableEffect(Unit) {
+        view.keepScreenOn = true
+        onDispose {
+            view.keepScreenOn = false
+        }
+    }
+
     BackHandler(onBack = onStop)
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            onSendMessage(JSONObject().apply {
+                put("type", "request_task_count")
+            }.toString())
+            delay(5000)
+        }
+    }
 
     LaunchedEffect(isPointerCaptured) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -637,8 +677,18 @@ fun ScreenSharingScreen(
         ) {
             Column(modifier = Modifier.padding(8.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    val latencyLabel = if (currentLatencyMs >= 0) {
+                        stringResource(R.string.latency_ms, currentLatencyMs)
+                    } else {
+                        stringResource(R.string.latency_unknown)
+                    }
                     Text(
-                        text = stringResource(R.string.stats_text, currentFps, currentMegabytesPerSecond),
+                        text = stringResource(
+                            R.string.stats_text,
+                            currentFps,
+                            currentMegabytesPerSecond,
+                            latencyLabel
+                        ),
                         style = MaterialTheme.typography.labelSmall
                     )
                     Spacer(modifier = Modifier.weight(1f))
@@ -767,6 +817,244 @@ fun ScreenSharingScreen(
         }
 
         Spacer(modifier = Modifier.height(8.dp))
+
+        TaskSwitcherSlider(
+            taskCount = openTaskCount,
+            onSendMessage = onSendMessage
+        )
+    }
+}
+
+private fun sendTaskSwitcher(onSendMessage: (String) -> Unit, action: String, steps: Int = 0) {
+    onSendMessage(JSONObject().apply {
+        put("type", "task_switcher")
+        put("action", action)
+        if (action == "step") put("steps", steps)
+    }.toString())
+}
+
+private fun displayTickForOffset(tabOffset: Int, taskCount: Int): Int {
+    if (taskCount < 2) return 0
+    return ((tabOffset % taskCount) + taskCount) % taskCount
+}
+
+@Composable
+private fun TaskSwitcherSegment(
+    active: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val primary = MaterialTheme.colorScheme.primary
+    val inactive = Color.White.copy(alpha = 0.14f)
+    val color by animateColorAsState(
+        targetValue = if (active) primary else inactive,
+        label = "taskSegment"
+    )
+    Box(
+        modifier = modifier
+            .fillMaxHeight()
+            .clip(RoundedCornerShape(6.dp))
+            .background(color)
+    )
+}
+
+@Composable
+private fun TaskSwitcherTrack(
+    taskCount: Int,
+    activeIndex: Int,
+    modifier: Modifier = Modifier
+) {
+    val primary = MaterialTheme.colorScheme.primary
+    val trackBg = Color.White.copy(alpha = 0.14f)
+
+    if (taskCount <= 12) {
+        Row(
+            modifier = modifier
+                .fillMaxWidth()
+                .height(12.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            repeat(taskCount) { index ->
+                TaskSwitcherSegment(
+                    active = index == activeIndex,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+    } else {
+        Canvas(
+            modifier = modifier
+                .fillMaxWidth()
+                .height(12.dp)
+        ) {
+            val radius = size.height / 2f
+            drawRoundRect(
+                color = trackBg,
+                size = size,
+                cornerRadius = CornerRadius(radius, radius)
+            )
+            val fraction = activeIndex.toFloat() / (taskCount - 1).coerceAtLeast(1)
+            val thumbRadius = radius * 0.85f
+            val thumbX = (fraction * size.width).coerceIn(thumbRadius, size.width - thumbRadius)
+            drawCircle(
+                color = primary,
+                radius = thumbRadius,
+                center = Offset(thumbX, size.height / 2f)
+            )
+        }
+    }
+}
+
+@Composable
+private fun TaskSwitcherSlider(
+    taskCount: Int,
+    onSendMessage: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val effectiveTaskCount = taskCount.coerceAtLeast(2)
+
+    val haptic = LocalHapticFeedback.current
+    val sendMessage by rememberUpdatedState(onSendMessage)
+    val density = LocalDensity.current
+    val verticalThresholdPx = with(density) { 48.dp.toPx() }
+    val tickSpacingPx = with(density) { 24.dp.toPx() }
+    var tabOffset by remember { mutableIntStateOf(0) }
+    var gestureActive by remember { mutableStateOf(false) }
+    var displayTaskCount by remember { mutableIntStateOf(effectiveTaskCount) }
+    val switcherActive = remember { mutableStateOf(false) }
+    val activeIndex = displayTickForOffset(tabOffset, displayTaskCount)
+
+    LaunchedEffect(taskCount, gestureActive) {
+        if (!gestureActive) {
+            displayTaskCount = taskCount.coerceAtLeast(2)
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            if (switcherActive.value) {
+                sendTaskSwitcher(sendMessage, "cancel")
+                switcherActive.value = false
+            }
+        }
+    }
+
+    Card(
+        modifier = modifier
+            .fillMaxWidth()
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    var completedNormally = false
+                    try {
+                        val down = awaitFirstDown()
+                        val pointerId = down.id
+                        gestureActive = true
+                        sendTaskSwitcher(sendMessage, "open")
+                        switcherActive.value = true
+                        tabOffset = 0
+                        var accumulatedDx = 0f
+                        var totalDx = 0f
+                        var totalDy = 0f
+
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull { it.id == pointerId } ?: break
+
+                            if (change.pressed) {
+                                val dragAmount = change.position - change.previousPosition
+                                totalDx += dragAmount.x
+                                totalDy += dragAmount.y
+                                accumulatedDx += dragAmount.x
+
+                                var stepDelta = 0
+                                while (accumulatedDx >= tickSpacingPx) {
+                                    accumulatedDx -= tickSpacingPx
+                                    tabOffset++
+                                    stepDelta++
+                                }
+                                while (accumulatedDx <= -tickSpacingPx) {
+                                    accumulatedDx += tickSpacingPx
+                                    tabOffset--
+                                    stepDelta--
+                                }
+                                if (stepDelta != 0) {
+                                    sendTaskSwitcher(sendMessage, "step", stepDelta)
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                }
+                            }
+
+                            if (change.changedToUp()) {
+                                val dominantVertical =
+                                    abs(totalDy) > abs(totalDx) && abs(totalDy) >= verticalThresholdPx
+                                val endAction = when {
+                                    dominantVertical && totalDy < 0f && tabOffset != 0 -> "dismiss"
+                                    dominantVertical && totalDy < 0f -> "start_menu"
+                                    tabOffset == 0 -> "cancel"
+                                    else -> "commit"
+                                }
+                                sendTaskSwitcher(sendMessage, endAction)
+                                switcherActive.value = false
+                                tabOffset = 0
+                                completedNormally = true
+                                break
+                            }
+
+                            change.consume()
+                        }
+                    } finally {
+                        if (!completedNormally && switcherActive.value) {
+                            sendTaskSwitcher(sendMessage, "cancel")
+                            switcherActive.value = false
+                        }
+                        gestureActive = false
+                    }
+                }
+            },
+        colors = CardDefaults.cardColors(
+            containerColor = Color.Black.copy(alpha = 0.8f)
+        )
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = stringResource(R.string.task_switcher_label),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = Color.White.copy(alpha = 0.7f)
+                )
+                Text(
+                    text = if (gestureActive) {
+                        stringResource(R.string.task_switcher_position, activeIndex + 1, displayTaskCount)
+                    } else {
+                        stringResource(R.string.task_switcher_apps, displayTaskCount)
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (gestureActive) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        Color.White.copy(alpha = 0.45f)
+                    }
+                )
+            }
+            Spacer(modifier = Modifier.height(10.dp))
+            TaskSwitcherTrack(
+                taskCount = displayTaskCount,
+                activeIndex = activeIndex
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = stringResource(R.string.task_switcher_hint),
+                style = MaterialTheme.typography.labelSmall,
+                color = Color.White.copy(alpha = 0.35f),
+                modifier = Modifier.align(Alignment.CenterHorizontally)
+            )
+        }
     }
 }
 
