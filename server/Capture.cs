@@ -3,8 +3,12 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
+using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Diagnostics;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 using Vortice.Direct3D;
@@ -18,6 +22,10 @@ namespace RemoteDesktop {
         private static volatile int monitorIndex = 0;
         private static volatile bool running = true;
         private static volatile bool cursorOnly = false;
+        private static volatile bool emitCursorMetadata = true;
+        private static int cursorUdpPort = 0;
+        private static UdpClient cursorUdpClient = null;
+        private static IPEndPoint cursorUdpEndpoint = null;
         private static bool dpiAwarenessEnabled = false;
         private static int streamMaxWidth = 2560;
         private static int streamMaxHeight = 1440;
@@ -30,6 +38,7 @@ namespace RemoteDesktop {
         private static int lastCursorMonitorWidth = 0;
         private static int lastCursorMonitorHeight = 0;
         private static string lastCursorMetadataJson = "";
+        private static readonly long cursorTimestampOrigin = Stopwatch.GetTimestamp();
 
         private sealed class MonitorProbeInfo {
             public int AdapterIndex;
@@ -40,7 +49,9 @@ namespace RemoteDesktop {
 
         private const int TARGET_FPS = 60;
         private const int FRAME_INTERVAL_MS = 1000 / TARGET_FPS;
+        private const int DEFAULT_CURSOR_HZ = 120;
         private const int DXGI_FRAME_TIMEOUT_MS = 1;
+        private static volatile int cursorTargetHz = DEFAULT_CURSOR_HZ;
 
         [DllImport("user32.dll")]
         private static extern bool SetProcessDPIAware();
@@ -80,6 +91,12 @@ namespace RemoteDesktop {
 
         [DllImport("user32.dll")]
         private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo);
+
+        [DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
+        private static extern uint TimeBeginPeriod(uint period);
+
+        [DllImport("winmm.dll", EntryPoint = "timeEndPeriod")]
+        private static extern uint TimeEndPeriod(uint period);
 
         private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
@@ -469,6 +486,18 @@ namespace RemoteDesktop {
                     inputOnly = true;
                 } else if (args[i] == "--cursor-only") {
                     cursorOnly = true;
+                } else if (args[i] == "--no-cursor-metadata") {
+                    emitCursorMetadata = false;
+                } else if (args[i] == "--cursor-udp-port" && i + 1 < args.Length) {
+                    if (int.TryParse(args[i + 1], out var parsedCursorUdpPort) && parsedCursorUdpPort > 0) {
+                        cursorUdpPort = parsedCursorUdpPort;
+                    }
+                    i++;
+                } else if (args[i] == "--cursor-hz" && i + 1 < args.Length) {
+                    if (int.TryParse(args[i + 1], out var parsedCursorHz) && parsedCursorHz > 0) {
+                        cursorTargetHz = parsedCursorHz;
+                    }
+                    i++;
                 } else if (args[i] == "--monitor" && i + 1 < args.Length) {
                     int newIndex;
                     if (int.TryParse(args[i + 1], out newIndex)) {
@@ -517,11 +546,13 @@ namespace RemoteDesktop {
             }
 
             if (cursorOnly) {
+                InitializeCursorUdpIfNeeded();
                 RunCursorOnlyLoop();
                 return;
             }
 
             using (var stdout = Console.OpenStandardOutput()) {
+                InitializeCursorUdpIfNeeded();
                 FrameCapturer capturer = null;
                 try {
                     capturer = new DxgiCapturer();
@@ -697,15 +728,38 @@ namespace RemoteDesktop {
             Console.Error.WriteLine($"Cursor metadata loop started for monitor {monitorIndex + 1} Source={sourceSize.Width}x{sourceSize.Height}");
             Console.Error.Flush();
 
-            while (running) {
-                try {
-                    EmitCursorMetadataForRegion(monitorX, monitorY, bounds.Width, bounds.Height, sourceSize.Width, sourceSize.Height);
-                    Thread.Sleep(FRAME_INTERVAL_MS);
-                } catch (Exception ex) {
+            var timerResolutionRaised = TimeBeginPeriod(1) == 0;
+            try {
+                var timer = Stopwatch.StartNew();
+                double ticksPerCursorSample = (double)Stopwatch.Frequency / Math.Max(1, cursorTargetHz);
+                long nextTick = 0;
+                while (running) {
                     try {
-                        Console.Error.WriteLine(ex.ToString());
-                        Console.Error.Flush();
-                    } catch { }
+                        EmitCursorMetadataForRegion(monitorX, monitorY, bounds.Width, bounds.Height, sourceSize.Width, sourceSize.Height);
+                        nextTick += (long)Math.Round(ticksPerCursorSample);
+                        long remainingTicks = nextTick - timer.ElapsedTicks;
+                        if (remainingTicks > Stopwatch.Frequency / 500) {
+                            int sleepMs = (int)((remainingTicks * 1000L) / Stopwatch.Frequency) - 1;
+                            if (sleepMs > 0) {
+                                Thread.Sleep(sleepMs);
+                            }
+                        }
+                        while (timer.ElapsedTicks < nextTick) {
+                            Thread.SpinWait(64);
+                        }
+                        if (timer.ElapsedTicks - nextTick > ticksPerCursorSample * 2.0) {
+                            nextTick = timer.ElapsedTicks;
+                        }
+                    } catch (Exception ex) {
+                        try {
+                            Console.Error.WriteLine(ex.ToString());
+                            Console.Error.Flush();
+                        } catch { }
+                    }
+                }
+            } finally {
+                if (timerResolutionRaised) {
+                    TimeEndPeriod(1);
                 }
             }
         }
@@ -713,14 +767,29 @@ namespace RemoteDesktop {
         private static void EmitCursorMetadata(bool visible, int x, int y, int width, int height, string base64, int hotX, int hotY) {
             try {
                 string imagePart = !string.IsNullOrEmpty(base64) ? $",\"img\":\"{base64}\"" : "";
-                string json = $"{{\"type\":\"cursor\",\"visible\":{(visible ? "true" : "false")},\"x\":{x},\"y\":{y},\"w\":{width},\"h\":{height},\"hx\":{hotX},\"hy\":{hotY}{imagePart}}}";
+                double sentAtMs = (Stopwatch.GetTimestamp() - cursorTimestampOrigin) * 1000.0 / Stopwatch.Frequency;
+                string sentAtMsText = sentAtMs.ToString("F3", CultureInfo.InvariantCulture);
+                string json = $"{{\"type\":\"cursor\",\"visible\":{(visible ? "true" : "false")},\"x\":{x},\"y\":{y},\"w\":{width},\"h\":{height},\"hx\":{hotX},\"hy\":{hotY},\"tm\":{sentAtMsText}{imagePart}}}";
                 if (json == lastCursorMetadataJson) {
                     return;
                 }
                 lastCursorMetadataJson = json;
-                Console.Error.WriteLine("CURSOR " + json);
-                Console.Error.Flush();
+                if (cursorUdpClient != null && cursorUdpEndpoint != null) {
+                    byte[] payload = Encoding.UTF8.GetBytes(json);
+                    cursorUdpClient.Send(payload, payload.Length, cursorUdpEndpoint);
+                } else {
+                    Console.Error.WriteLine("CURSOR " + json);
+                    Console.Error.Flush();
+                }
             } catch { }
+        }
+
+        private static void InitializeCursorUdpIfNeeded() {
+            if (cursorUdpPort <= 0 || cursorUdpClient != null) {
+                return;
+            }
+            cursorUdpClient = new UdpClient();
+            cursorUdpEndpoint = new IPEndPoint(IPAddress.Loopback, cursorUdpPort);
         }
 
         private static Bitmap NormalizeCursorBitmap(
@@ -858,7 +927,9 @@ namespace RemoteDesktop {
         }
 
         private static void DrawCursorOnBitmap(Bitmap bitmap, int monitorX, int monitorY, int monitorWidth, int monitorHeight) {
-            EmitCursorMetadataForRegion(monitorX, monitorY, monitorWidth, monitorHeight, bitmap.Width, bitmap.Height);
+            if (emitCursorMetadata) {
+                EmitCursorMetadataForRegion(monitorX, monitorY, monitorWidth, monitorHeight, bitmap.Width, bitmap.Height);
+            }
         }
 
         private static unsafe void AlphaBlendBgraOntoBitmap(Bitmap bitmap, int destX, int destY, byte[] src, int width, int height, int pitch) {

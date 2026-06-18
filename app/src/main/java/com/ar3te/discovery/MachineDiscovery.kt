@@ -85,6 +85,7 @@ class MachineDiscovery(
             val host = json.optString("host").trim()
             val port = json.optInt("port", DiscoveryProtocol.PORT)
             val wsPort = json.optInt("wsPort", 45679)
+            val cursorWsPort = json.optInt("cursorWsPort", 45680)
             if (name.isEmpty() || host.isEmpty()) {
                 return null
             }
@@ -95,6 +96,7 @@ class MachineDiscovery(
                 port = port,
                 lastSeenMs = System.currentTimeMillis(),
                 wsPort = wsPort,
+                cursorWsPort = cursorWsPort,
             )
         } catch (_: Exception) {
             null

@@ -6,4 +6,5 @@ data class DiscoveredMachine(
     val port: Int,
     val lastSeenMs: Long,
     val wsPort: Int = 45679,
+    val cursorWsPort: Int = 45680,
 )

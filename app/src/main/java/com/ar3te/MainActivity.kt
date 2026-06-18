@@ -194,6 +194,7 @@ class MainActivity : ComponentActivity() {
                             currentCaptureMethod = externalDisplayService?.currentCaptureMethod ?: stringResource(R.string.loading),
                             currentAudioState = externalDisplayService?.currentAudioState ?: stringResource(R.string.loading),
                             framePacingSamples = externalDisplayService?.framePacingSamples ?: emptyList(),
+                            cursorPacingSamples = externalDisplayService?.cursorPacingSamples ?: emptyList(),
                             openTaskCount = openTaskCount,
                             isPointerCaptured = isPointerCaptured,
                             is3DofEnabled = is3DofEnabled,
@@ -202,6 +203,7 @@ class MainActivity : ComponentActivity() {
                             showEmbeddedPreview = externalDisplayService?.hasPresentationDisplay != true,
                             previewCursorX = externalDisplayService?.localCursorX ?: 0f,
                             previewCursorY = externalDisplayService?.localCursorY ?: 0f,
+                            previewLastLocalMoveTime = externalDisplayService?.lastLocalMoveTime ?: 0L,
                             onStop = { 
                                 activeMachine = null
                                 externalDisplayService?.activeMachine = null
@@ -240,6 +242,9 @@ class MainActivity : ComponentActivity() {
                             },
                             onPreviewFramePacingUpdated = { samples ->
                                 externalDisplayService?.updateFramePacing(samples)
+                            },
+                            onPreviewCursorPacingUpdated = { samples ->
+                                externalDisplayService?.updateCursorPacing(samples)
                             },
                             onPreviewTaskCountUpdated = { count ->
                                 externalDisplayService?.updateTaskCount(count)
@@ -490,6 +495,7 @@ fun ScreenSharingScreen(
     currentCaptureMethod: String,
     currentAudioState: String,
     framePacingSamples: List<Float>,
+    cursorPacingSamples: List<Float>,
     openTaskCount: Int,
     isPointerCaptured: Boolean,
     is3DofEnabled: Boolean,
@@ -498,6 +504,7 @@ fun ScreenSharingScreen(
     showEmbeddedPreview: Boolean,
     previewCursorX: Float,
     previewCursorY: Float,
+    previewLastLocalMoveTime: Long,
     onStop: () -> Unit,
     onMonitorSwitch: (Int) -> Unit,
     onSendMessage: (String) -> Unit,
@@ -507,6 +514,7 @@ fun ScreenSharingScreen(
     onPreviewCaptureMethodUpdated: (String) -> Unit,
     onPreviewAudioStateUpdated: (String) -> Unit,
     onPreviewFramePacingUpdated: (List<Float>) -> Unit,
+    onPreviewCursorPacingUpdated: (List<Float>) -> Unit,
     onPreviewTaskCountUpdated: (Int) -> Unit,
     onPreviewRemoteCursorReceived: (Float, Float, Int, Int) -> Unit,
     onCapturedMouseEvent: (MotionEvent) -> Boolean,
@@ -515,16 +523,22 @@ fun ScreenSharingScreen(
     onStreamModeChange: (StreamMode) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
     var monitorIndex by remember { mutableIntStateOf(1) }
     var showDebugMenu by remember { mutableStateOf(false) }
-    var showFramePacingGraph by remember { mutableStateOf(false) }
+    var showFramePacingGraph by remember {
+        mutableStateOf(AppPreferences.getShowFramePacingGraph(context))
+    }
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusRequester = remember { FocusRequester() }
     var keyboardText by remember { mutableStateOf(TextFieldValue(" ", selection = TextRange(1))) }
     val view = LocalView.current
-    val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
     val currentCapturedMouseEvent by rememberUpdatedState(onCapturedMouseEvent)
+
+    LaunchedEffect(showFramePacingGraph) {
+        AppPreferences.setShowFramePacingGraph(context, showFramePacingGraph)
+    }
 
     DisposableEffect(Unit) {
         view.keepScreenOn = true
@@ -812,13 +826,15 @@ fun ScreenSharingScreen(
                     onCaptureMethodUpdated = onPreviewCaptureMethodUpdated,
                     onAudioStateUpdated = onPreviewAudioStateUpdated,
                     onFramePacingUpdated = onPreviewFramePacingUpdated,
+                    onCursorPacingUpdated = onPreviewCursorPacingUpdated,
                     onTaskCountUpdated = onPreviewTaskCountUpdated,
                     streamMode = streamMode,
                     lastInteractiveInputMs = lastInteractiveInputMs,
                     onClientReady = onPreviewClientReady,
                     onRemoteCursorReceived = onPreviewRemoteCursorReceived,
                     localCursorX = previewCursorX,
-                    localCursorY = previewCursorY
+                    localCursorY = previewCursorY,
+                    lastLocalMoveTime = previewLastLocalMoveTime
                 )
             }
 
@@ -934,6 +950,7 @@ fun ScreenSharingScreen(
                 if (showFramePacingGraph) {
                     FramePacingGraph(
                         samples = framePacingSamples,
+                        cursorSamples = cursorPacingSamples,
                         modifier = Modifier.fillMaxSize()
                     )
                 }
@@ -957,12 +974,15 @@ fun ScreenSharingScreen(
 @Composable
 private fun FramePacingGraph(
     samples: List<Float>,
+    cursorSamples: List<Float>,
     modifier: Modifier = Modifier
 ) {
     val graphColor = Color.LightGray.copy(alpha = 0.95f)
+    val cursorGraphColor = Color(0xFF42A5F5).copy(alpha = 0.95f)
     val guideColor = Color.Gray.copy(alpha = 0.45f)
     val targetColor = Color(0xFFBDBDBD).copy(alpha = 0.95f)
     val latestColor = Color.White.copy(alpha = 0.95f)
+    val cursorLatestColor = Color(0xFF90CAF9).copy(alpha = 0.95f)
     val labelColor = Color.LightGray.copy(alpha = 0.9f)
     val startIndex = 0
     val middleIndex = if (samples.isEmpty()) 0 else (samples.lastIndex / 2)
@@ -971,7 +991,7 @@ private fun FramePacingGraph(
     val latestMs = samples.lastOrNull() ?: baselineMs
     val avgMs = if (samples.isNotEmpty()) samples.average().toFloat() else baselineMs
     val minMs = samples.minOrNull() ?: baselineMs
-    val maxSampleMs = samples.maxOrNull() ?: baselineMs
+    val maxSampleMs = maxOf(samples.maxOrNull() ?: baselineMs, cursorSamples.maxOrNull() ?: baselineMs)
     val maxMs = maxOf(baselineMs * 2f, maxSampleMs)
 
     BoxWithConstraints(modifier = modifier) {
@@ -989,6 +1009,11 @@ private fun FramePacingGraph(
                 Text(
                     text = stringResource(R.string.frame_pacing_stats, latestMs, avgMs, minMs, maxSampleMs),
                     color = labelColor,
+                    style = MaterialTheme.typography.labelSmall
+                )
+                Text(
+                    text = "cursor ${cursorSamples.lastOrNull()?.let { "%.1f".format(it) } ?: "--"} ms",
+                    color = cursorGraphColor,
                     style = MaterialTheme.typography.labelSmall
                 )
             }
@@ -1028,28 +1053,54 @@ private fun FramePacingGraph(
                     strokeWidth = 1.5.dp.toPx()
                 )
                 if (samples.size < 2) {
-                    return@Canvas
+                    if (cursorSamples.size < 2) {
+                        return@Canvas
+                    }
                 }
-                val stepX = size.width / (samples.size - 1).coerceAtLeast(1)
-                var previous = Offset(x = 0f, y = toY(samples.first()))
-                for (i in 1 until samples.size) {
-                    val current = Offset(
-                        x = stepX * i,
-                        y = toY(samples[i])
+                if (samples.size >= 2) {
+                    val stepX = size.width / (samples.size - 1).coerceAtLeast(1)
+                    var previous = Offset(x = 0f, y = toY(samples.first()))
+                    for (i in 1 until samples.size) {
+                        val current = Offset(
+                            x = stepX * i,
+                            y = toY(samples[i])
+                        )
+                        drawLine(
+                            color = graphColor,
+                            start = previous,
+                            end = current,
+                            strokeWidth = 2.5.dp.toPx()
+                        )
+                        previous = current
+                    }
+                    drawCircle(
+                        color = latestColor,
+                        radius = 3.dp.toPx(),
+                        center = previous
                     )
-                    drawLine(
-                        color = graphColor,
-                        start = previous,
-                        end = current,
-                        strokeWidth = 2.5.dp.toPx()
-                    )
-                    previous = current
                 }
-                drawCircle(
-                    color = latestColor,
-                    radius = 3.dp.toPx(),
-                    center = previous
-                )
+                if (cursorSamples.size >= 2) {
+                    val cursorStepX = size.width / (cursorSamples.size - 1).coerceAtLeast(1)
+                    var cursorPrevious = Offset(x = 0f, y = toY(cursorSamples.first()))
+                    for (i in 1 until cursorSamples.size) {
+                        val current = Offset(
+                            x = cursorStepX * i,
+                            y = toY(cursorSamples[i])
+                        )
+                        drawLine(
+                            color = cursorGraphColor,
+                            start = cursorPrevious,
+                            end = current,
+                            strokeWidth = 2.dp.toPx()
+                        )
+                        cursorPrevious = current
+                    }
+                    drawCircle(
+                        color = cursorLatestColor,
+                        radius = 2.5.dp.toPx(),
+                        center = cursorPrevious
+                    )
+                }
             }
                 Column(
                     modifier = Modifier

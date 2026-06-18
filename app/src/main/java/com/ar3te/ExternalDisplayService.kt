@@ -10,14 +10,21 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LifecycleService
+import androidx.lifecycle.lifecycleScope
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.ar3te.discovery.DiscoveredMachine
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 class ExternalDisplayService : LifecycleService() {
 
@@ -80,6 +87,7 @@ class ExternalDisplayService : LifecycleService() {
         get() = _streamMode
         set(value) {
             _streamMode = value
+            AppPreferences.setStreamMode(this, value)
             presentation?.streamMode = value
         }
 
@@ -125,6 +133,13 @@ class ExternalDisplayService : LifecycleService() {
             _framePacingSamples = value
         }
 
+    private var _cursorPacingSamples by mutableStateOf<List<Float>>(emptyList())
+    var cursorPacingSamples: List<Float>
+        get() = _cursorPacingSamples
+        private set(value) {
+            _cursorPacingSamples = value
+        }
+
     private var _openTaskCount by mutableIntStateOf(0)
     var openTaskCount: Int
         get() = _openTaskCount
@@ -144,6 +159,13 @@ class ExternalDisplayService : LifecycleService() {
     var lastLocalMoveTime by mutableStateOf(0L)
     var remoteWidth by mutableIntStateOf(1920)
     var remoteHeight by mutableIntStateOf(1080)
+    private val cursorSendLock = Any()
+    private var cursorSenderJob: Job? = null
+    private var pendingCursorMoveX = 0
+    private var pendingCursorMoveY = 0
+    private var hasPendingCursorMove = false
+    private var lastCursorMoveUpdateMs = 0L
+    private var lastCursorMoveSentMs = 0L
 
     fun updateLocalCursor(dx: Float, dy: Float) {
         localCursorX = (localCursorX + dx).coerceIn(0f, remoteWidth.toFloat())
@@ -152,12 +174,9 @@ class ExternalDisplayService : LifecycleService() {
         
         presentation?.localCursorX = localCursorX
         presentation?.localCursorY = localCursorY
-        
-        sendRemoteMessage(org.json.JSONObject().apply {
-            put("type", "mouse_move_abs")
-            put("x", localCursorX.toInt())
-            put("y", localCursorY.toInt())
-        }.toString())
+        presentation?.lastLocalMoveTime = lastLocalMoveTime
+
+        queueLocalCursorMove(localCursorX.toInt(), localCursorY.toInt())
     }
 
     fun syncLocalCursorFromRemote(x: Float, y: Float, w: Int, h: Int) {
@@ -169,12 +188,13 @@ class ExternalDisplayService : LifecycleService() {
             localCursorY = y
             presentation?.localCursorX = x
             presentation?.localCursorY = y
+            presentation?.lastLocalMoveTime = lastLocalMoveTime
         }
     }
 
     fun sendRemoteMessage(message: String) {
         noteInteractiveInput(message)
-        presentation?.onSendMessage?.invoke(message) ?: inAppPreviewSender?.invoke(message)
+        sendRemoteMessageDirect(message)
     }
 
     private fun noteInteractiveInput(message: String) {
@@ -190,6 +210,94 @@ class ExternalDisplayService : LifecycleService() {
             lastInteractiveInputMs = System.currentTimeMillis()
             presentation?.lastInteractiveInputMs = lastInteractiveInputMs
         }
+    }
+
+    private fun noteInteractiveInputType(type: String) {
+        if (_streamMode != StreamMode.AUTO || type !in INTERACTIVE_MESSAGE_TYPES) {
+            return
+        }
+        lastInteractiveInputMs = System.currentTimeMillis()
+        presentation?.lastInteractiveInputMs = lastInteractiveInputMs
+    }
+
+    private fun sendRemoteMessageDirect(message: String) {
+        presentation?.onSendMessage?.invoke(message) ?: inAppPreviewSender?.invoke(message)
+    }
+
+    private fun queueLocalCursorMove(x: Int, y: Int) {
+        noteInteractiveInputType("mouse_move_abs")
+
+        val now = SystemClock.elapsedRealtime()
+        var immediateMessage: String? = null
+        synchronized(cursorSendLock) {
+            pendingCursorMoveX = x
+            pendingCursorMoveY = y
+            hasPendingCursorMove = true
+            lastCursorMoveUpdateMs = now
+            if (now - lastCursorMoveSentMs >= CURSOR_SEND_INTERVAL_MS) {
+                hasPendingCursorMove = false
+                lastCursorMoveSentMs = now
+                immediateMessage = buildMouseMoveAbsMessage(x, y)
+            }
+        }
+
+        if (immediateMessage != null) {
+            sendRemoteMessageDirect(immediateMessage!!)
+        }
+        ensureCursorSenderRunning()
+    }
+
+    private fun ensureCursorSenderRunning() {
+        synchronized(cursorSendLock) {
+            if (cursorSenderJob?.isActive == true) {
+                return
+            }
+            cursorSenderJob = lifecycleScope.launch(Dispatchers.Default) {
+                try {
+                    while (isActive) {
+                        var nextMessage: String? = null
+                        var delayMs = CURSOR_SEND_INTERVAL_MS
+                        var shouldStop = false
+
+                        synchronized(cursorSendLock) {
+                            val now = SystemClock.elapsedRealtime()
+                            val sinceLastSend = now - lastCursorMoveSentMs
+                            val sinceLastUpdate = now - lastCursorMoveUpdateMs
+                            if (hasPendingCursorMove && sinceLastSend >= CURSOR_SEND_INTERVAL_MS) {
+                                nextMessage = buildMouseMoveAbsMessage(pendingCursorMoveX, pendingCursorMoveY)
+                                hasPendingCursorMove = false
+                                lastCursorMoveSentMs = now
+                            } else if (!hasPendingCursorMove && sinceLastUpdate >= CURSOR_SEND_IDLE_TIMEOUT_MS) {
+                                shouldStop = true
+                            } else {
+                                delayMs = if (hasPendingCursorMove) {
+                                    (CURSOR_SEND_INTERVAL_MS - sinceLastSend).coerceAtLeast(1L)
+                                } else {
+                                    (CURSOR_SEND_IDLE_TIMEOUT_MS - sinceLastUpdate).coerceAtLeast(1L)
+                                }
+                            }
+                        }
+
+                        if (nextMessage != null) {
+                            sendRemoteMessageDirect(nextMessage!!)
+                            continue
+                        }
+                        if (shouldStop) {
+                            break
+                        }
+                        delay(delayMs)
+                    }
+                } finally {
+                    synchronized(cursorSendLock) {
+                        cursorSenderJob = null
+                    }
+                }
+            }
+        }
+    }
+
+    private fun buildMouseMoveAbsMessage(x: Int, y: Int): String {
+        return "{\"type\":\"mouse_move_abs\",\"x\":$x,\"y\":$y}"
     }
 
     fun setInAppPreviewSender(sender: ((String) -> Unit)?) {
@@ -217,6 +325,10 @@ class ExternalDisplayService : LifecycleService() {
         framePacingSamples = samples
     }
 
+    fun updateCursorPacing(samples: List<Float>) {
+        cursorPacingSamples = samples
+    }
+
     fun updateTaskCount(count: Int) {
         openTaskCount = count
         taskCountListener?.invoke(count)
@@ -241,6 +353,7 @@ class ExternalDisplayService : LifecycleService() {
 
     override fun onCreate() {
         super.onCreate()
+        _streamMode = AppPreferences.getStreamMode(this)
         displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
         displayManager.registerDisplayListener(displayListener, null)
         
@@ -271,6 +384,7 @@ class ExternalDisplayService : LifecycleService() {
                     lastInteractiveInputMs = this@ExternalDisplayService.lastInteractiveInputMs
                     localCursorX = this@ExternalDisplayService.localCursorX
                     localCursorY = this@ExternalDisplayService.localCursorY
+                    lastLocalMoveTime = this@ExternalDisplayService.lastLocalMoveTime
                     onStatsUpdated = { f, megabytesPerSecond, method, latencyMs ->
                         updateStreamStats(f, megabytesPerSecond, method, latencyMs)
                     }
@@ -282,6 +396,9 @@ class ExternalDisplayService : LifecycleService() {
                     }
                     onFramePacingUpdated = { samples ->
                         updateFramePacing(samples)
+                    }
+                    onCursorPacingUpdated = { samples ->
+                        updateCursorPacing(samples)
                     }
                     onTaskCountUpdated = { count ->
                         updateTaskCount(count)
@@ -319,6 +436,11 @@ class ExternalDisplayService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        synchronized(cursorSendLock) {
+            cursorSenderJob?.cancel()
+            cursorSenderJob = null
+            hasPendingCursorMove = false
+        }
         updateWakeLock(false)
         displayManager.unregisterDisplayListener(displayListener)
         presentation?.dismiss()
@@ -329,6 +451,8 @@ class ExternalDisplayService : LifecycleService() {
     companion object {
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "external_display_channel"
+        private const val CURSOR_SEND_INTERVAL_MS = 8L
+        private const val CURSOR_SEND_IDLE_TIMEOUT_MS = 125L
         private val INTERACTIVE_MESSAGE_TYPES = setOf(
             "mouse_move",
             "mouse_move_abs",

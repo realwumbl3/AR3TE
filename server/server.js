@@ -9,6 +9,8 @@ const { WebSocketServer } = require("ws");
 
 const PORT = 45678;
 const WS_PORT = 45679;
+const CURSOR_WS_PORT = 45680;
+const CURSOR_UDP_PORT = 45681;
 const DISCOVER_MSG = "AR3TE_DISCOVER";
 const VIDEO_BINARY_TYPE = 1;
 const VIDEO_TIMESTAMP_BYTES = 8;
@@ -27,8 +29,10 @@ const AUDIO_DEVICE_CANDIDATES = [
 const PORT_RECLAIM_TIMEOUT_MS = 10000;
 const PORT_RECLAIM_POLL_MS = 200;
 let discoverySocket = null;
+let cursorUdpSocket = null;
 let discoveryBindAttempts = 0;
 let wsBindAttempts = 0;
+let cursorWsBindAttempts = 0;
 
 function getPidsOnPort(port) {
   const pids = new Set();
@@ -121,7 +125,7 @@ function waitForPortsToBeFree(ports, timeoutMs = PORT_RECLAIM_TIMEOUT_MS) {
 }
 
 function killExistingInstances() {
-  const ports = [PORT, WS_PORT];
+  const ports = [PORT, WS_PORT, CURSOR_WS_PORT];
   const seen = new Set();
   const deadline = Date.now() + PORT_RECLAIM_TIMEOUT_MS;
 
@@ -283,6 +287,7 @@ function createDiscoverySocket() {
       host,
       port: PORT,
       wsPort: WS_PORT,
+      cursorWsPort: CURSOR_WS_PORT,
     });
 
     socket.send(payload, remote.port, remote.address);
@@ -314,9 +319,29 @@ function createDiscoverySocket() {
     console.log(`  Machine: ${machineName}`);
     console.log(`  UDP Discovery: ${localIp}:${PORT}`);
     console.log(`  WebSocket Stream: ws://${localIp}:${WS_PORT}`);
+    console.log(`  Cursor Stream: ws://${localIp}:${CURSOR_WS_PORT}`);
     if (reachable.length > 1) {
       console.log(`  Reachable IPs: ${reachable.join(", ")}`);
     }
+  });
+
+  return socket;
+}
+
+function createCursorUdpSocket() {
+  const socket = dgram.createSocket("udp4");
+
+  socket.on("message", (message) => {
+    const payload = message.toString("utf8");
+    if (!payload) {
+      return;
+    }
+    lastCursorMessage = payload;
+    broadcastCursorText(payload);
+  });
+
+  socket.on("error", (error) => {
+    console.error(`Cursor UDP error: ${error.message || error}`);
   });
 
   return socket;
@@ -328,7 +353,13 @@ function bindDiscoverySocket() {
   discoverySocket.bind(PORT);
 }
 
+function bindCursorUdpSocket() {
+  cursorUdpSocket = createCursorUdpSocket();
+  cursorUdpSocket.bind(CURSOR_UDP_PORT, "127.0.0.1");
+}
+
 bindDiscoverySocket();
+bindCursorUdpSocket();
 
 // --- GPU H.264 Capture Process ---
 const ffmpegCandidates = [
@@ -380,6 +411,7 @@ let lastCursorMessage = null;
 let currentCaptureMethod = "";
 let directCaptureAllowed = true;
 let wss = null;
+let cursorWss = null;
 let activeStreamMode = STREAM_MODE_LOW_LATENCY;
 const DEBUG_PACING = process.env.AR3TE_DEBUG_PACING !== "0";
 const TARGET_FRAME_INTERVAL_MS = 1000 / 60;
@@ -414,6 +446,15 @@ function resendCurrentVideoState(ws = null) {
     }
     if (lastKeyframe) {
       client.send(lastKeyframe);
+    }
+  }
+}
+
+function resendCurrentCursorState(ws = null) {
+  const targets = ws ? [ws] : Array.from(cursorWss?.clients || []);
+  for (const client of targets) {
+    if (client.readyState !== 1) {
+      continue;
     }
     if (lastCursorMessage) {
       client.send(lastCursorMessage);
@@ -908,6 +949,17 @@ function broadcastText(message) {
   });
 }
 
+function broadcastCursorText(message) {
+  if (!cursorWss) {
+    return;
+  }
+  cursorWss.clients.forEach((client) => {
+    if (client.readyState === 1) {
+      client.send(message);
+    }
+  });
+}
+
 function sendVideoConfig() {
   if (!lastVideoConfig || sentVideoConfig) {
     return;
@@ -946,7 +998,7 @@ function handleRawCaptureStderr(chunk) {
   for (const line of lines) {
     if (line.startsWith("CURSOR ")) {
       lastCursorMessage = line.slice(7);
-      broadcastText(lastCursorMessage);
+      broadcastCursorText(lastCursorMessage);
     } else if (line.trim()) {
       process.stderr.write(`[capture] ${line}\n`);
     }
@@ -1352,7 +1404,8 @@ function startRawCapturePipeline() {
   rawCaptureStderrBuffer = "";
   currentCaptureMethod = "DXGI duplicate output";
   const captureExe = path.join(__dirname, "Capture.exe");
-  const captureArgs = ["--raw", "--monitor", String(activeMonitorIndex + 1), "--stream-size", `${activeVideoInfo.width}x${activeVideoInfo.height}`];
+  const captureArgs = ["--raw", "--monitor", String(activeMonitorIndex + 1), "--stream-size", `${activeVideoInfo.width}x${activeVideoInfo.height}`, "--cursor-udp-port", String(CURSOR_UDP_PORT), "--no-cursor-metadata"];
+  const cursorArgs = ["--cursor-only", "--monitor", String(activeMonitorIndex + 1), "--stream-size", `${activeVideoInfo.width}x${activeVideoInfo.height}`, "--cursor-udp-port", String(CURSOR_UDP_PORT)];
   const ffmpegArgs = buildRawFfmpegArgs(currentEncoderName, activeVideoInfo);
   console.log(
     `Starting raw capture + ${currentEncoderName} on monitor ${activeMonitorIndex + 1} ` +
@@ -1361,6 +1414,7 @@ function startRawCapturePipeline() {
       `(${activeMonitorInfo.width}x${activeMonitorInfo.height} -> ${activeVideoInfo.width}x${activeVideoInfo.height})`
   );
   sendCaptureStatus();
+  cursorCaptureProcess = spawn(captureExe, cursorArgs, { stdio: ["ignore", "ignore", "pipe"] });
   rawCaptureProcess = spawn(captureExe, captureArgs, { stdio: ["ignore", "pipe", "pipe"] });
   captureProcess = spawn(ffmpegPath, ffmpegArgs, { stdio: ["pipe", "pipe", "pipe"] });
   rawCaptureProcess.stdout.pipe(captureProcess.stdin);
@@ -1371,6 +1425,15 @@ function startRawCapturePipeline() {
   });
   rawCaptureProcess.stderr.on("data", (chunk) => {
     handleRawCaptureStderr(chunk);
+  });
+  cursorCaptureProcess.stderr.on("data", (chunk) => {
+    handleRawCaptureStderr(chunk);
+  });
+  cursorCaptureProcess.on("exit", (code, signal) => {
+    if (shuttingDown || restartRequested) {
+      return;
+    }
+    console.error(`cursor metadata process exited (code=${code}, signal=${signal})`);
   });
   rawCaptureProcess.on("exit", (code, signal) => {
     if (shuttingDown || restartRequested) {
@@ -1448,7 +1511,7 @@ function startDirectCapturePipeline() {
   currentCaptureMethod = "Direct D3D11 duplicate output -> NVENC";
   const captureExe = path.join(__dirname, "Capture.exe");
   activeVideoInfo = getStreamSize(activeMonitorInfo, activeMonitorIndex);
-  const cursorArgs = ["--cursor-only", "--monitor", String(activeMonitorIndex + 1), "--stream-size", `${activeVideoInfo.width}x${activeVideoInfo.height}`];
+  const cursorArgs = ["--cursor-only", "--monitor", String(activeMonitorIndex + 1), "--stream-size", `${activeVideoInfo.width}x${activeVideoInfo.height}`, "--cursor-udp-port", String(CURSOR_UDP_PORT)];
   const ffmpegArgs = buildDirectFfmpegArgs(probeInfo, activeVideoInfo);
   console.log(
     `Starting direct GPU capture + ${currentEncoderName} on monitor ${activeMonitorIndex + 1} ` +
@@ -1642,9 +1705,9 @@ startAudioCapturePipeline();
 
 function resolveCaptureExe() {
   const candidates = [
-    path.join(__dirname, "Capture.exe"),
     path.join(__dirname, "bin", "Release", "net8.0-windows", "Capture.exe"),
     path.join(__dirname, "bin", "Debug", "net8.0-windows", "Capture.exe"),
+    path.join(__dirname, "Capture.exe"),
   ];
   for (const candidate of candidates) {
     if (fs.existsSync(candidate)) {
@@ -1920,6 +1983,8 @@ startInputProcess();
 // --- WebSocket Server ---
 const server = http.createServer();
 wss = new WebSocketServer({ server, perMessageDeflate: false });
+const cursorServer = http.createServer();
+cursorWss = new WebSocketServer({ server: cursorServer, perMessageDeflate: false });
 
 function handleWebSocketBindError(error) {
   if (error.code === "EADDRINUSE" && wsBindAttempts < 5) {
@@ -1940,6 +2005,7 @@ function handleWebSocketBindError(error) {
 }
 
 wss.on("error", handleWebSocketBindError);
+cursorWss.on("error", handleCursorWebSocketBindError);
 
 wss.on("connection", (ws) => {
   if (ws._socket?.setNoDelay) {
@@ -1957,9 +2023,6 @@ wss.on("connection", (ws) => {
   }
   if (lastKeyframe) {
     ws.send(lastKeyframe);
-  }
-  if (lastCursorMessage) {
-    ws.send(lastCursorMessage);
   }
   broadcastTaskCount(lastKnownTaskCount);
   requestInputTaskCount(true);
@@ -2033,6 +2096,35 @@ wss.on("connection", (ws) => {
   });
 });
 
+function handleCursorWebSocketBindError(error) {
+  if (error.code === "EADDRINUSE" && cursorWsBindAttempts < 5) {
+    console.warn(`Port ${CURSOR_WS_PORT} is busy, retrying cursor WebSocket bind...`);
+    killExistingInstances();
+    try {
+      cursorServer.close();
+    } catch {
+      // Server may already be closing or closed.
+    }
+    const retryDelay = Math.min(1000, 200 * cursorWsBindAttempts);
+    setTimeout(bindCursorWebSocketServer, retryDelay);
+    return;
+  }
+
+  console.error(error.code === "EADDRINUSE" ? `Port ${CURSOR_WS_PORT} is already in use.` : error);
+  process.exit(1);
+}
+
+cursorWss.on("connection", (ws) => {
+  if (ws._socket?.setNoDelay) {
+    ws._socket.setNoDelay(true);
+  }
+  console.log("Cursor client connected");
+  resendCurrentCursorState(ws);
+  ws.on("close", () => {
+    console.log("Cursor client disconnected");
+  });
+});
+
 function bindWebSocketServer() {
   wsBindAttempts += 1;
   if (!waitForPortsToBeFree([WS_PORT], 2000)) {
@@ -2041,9 +2133,19 @@ function bindWebSocketServer() {
   server.listen(WS_PORT);
 }
 
+function bindCursorWebSocketServer() {
+  cursorWsBindAttempts += 1;
+  if (!waitForPortsToBeFree([CURSOR_WS_PORT], 2000)) {
+    killExistingInstances();
+  }
+  cursorServer.listen(CURSOR_WS_PORT);
+}
+
 server.on("error", handleWebSocketBindError);
+cursorServer.on("error", handleCursorWebSocketBindError);
 
 bindWebSocketServer();
+bindCursorWebSocketServer();
 
 function shutdown() {
   shuttingDown = true;
@@ -2056,7 +2158,17 @@ function shutdown() {
     // Socket may already be closed.
   }
   try {
+    cursorUdpSocket?.close();
+  } catch {
+    // Socket may already be closed.
+  }
+  try {
     server.close();
+  } catch {
+    // Server may already be closed.
+  }
+  try {
+    cursorServer.close();
   } catch {
     // Server may already be closed.
   }

@@ -117,6 +117,7 @@ private const val VIDEO_HEADER_BYTES = 1 + VIDEO_TIMESTAMP_BYTES
 private const val ENABLE_DEBUG_LOGS = false
 private const val AUTO_MODE_COOLDOWN_MS = 3_000L
 private const val FRAME_PACING_SAMPLE_COUNT = 120
+private const val LOCAL_CURSOR_PREFERENCE_MS = 125L
 
 private fun debugLog(tag: String, message: String) {
     if (!ENABLE_DEBUG_LOGS) {
@@ -205,10 +206,12 @@ class ExternalDisplayPresentation(
     var is3DofEnabled by mutableStateOf(false)
     var streamMode by mutableStateOf(StreamMode.LOW_LATENCY)
     var lastInteractiveInputMs by mutableLongStateOf(0L)
+    var lastLocalMoveTime by mutableLongStateOf(0L)
     var onStatsUpdated: ((Int, Double, String?, Int) -> Unit)? = null
     var onCaptureMethodUpdated: ((String) -> Unit)? = null
     var onAudioStateUpdated: ((String) -> Unit)? = null
     var onFramePacingUpdated: ((List<Float>) -> Unit)? = null
+    var onCursorPacingUpdated: ((List<Float>) -> Unit)? = null
     var onTaskCountUpdated: ((Int) -> Unit)? = null
     var onSendMessage: ((String) -> Unit)? = null
     var onRemoteCursorReceived: ((Float, Float, Int, Int) -> Unit)? = null
@@ -240,10 +243,12 @@ class ExternalDisplayPresentation(
                     is3DofEnabled,
                     streamMode,
                     lastInteractiveInputMs,
+                    lastLocalMoveTime,
                     onStatsUpdated, 
                     onCaptureMethodUpdated, 
                     onAudioStateUpdated,
                     onFramePacingUpdated,
+                    onCursorPacingUpdated,
                     onTaskCountUpdated,
                     { onSendMessage = it },
                     { x, y, w, h -> onRemoteCursorReceived?.invoke(x, y, w, h) },
@@ -275,10 +280,12 @@ fun ExternalDisplayScreen(
     is3DofEnabled: Boolean = false,
     streamMode: StreamMode = StreamMode.LOW_LATENCY,
     lastInteractiveInputMs: Long = 0L,
+    lastLocalMoveTime: Long = 0L,
     onStatsUpdated: ((Int, Double, String?, Int) -> Unit)? = null,
     onCaptureMethodUpdated: ((String) -> Unit)? = null,
     onAudioStateUpdated: ((String) -> Unit)? = null,
     onFramePacingUpdated: ((List<Float>) -> Unit)? = null,
+    onCursorPacingUpdated: ((List<Float>) -> Unit)? = null,
     onTaskCountUpdated: ((Int) -> Unit)? = null,
     onClientReady: ((String) -> Unit) -> Unit = {},
     onRemoteCursorReceived: (Float, Float, Int, Int) -> Unit = { _, _, _, _ -> },
@@ -294,10 +301,12 @@ fun ExternalDisplayScreen(
                 is3DofEnabled,
                 streamMode,
                 lastInteractiveInputMs,
+                lastLocalMoveTime,
                 onStatsUpdated, 
                 onCaptureMethodUpdated, 
                 onAudioStateUpdated,
                 onFramePacingUpdated,
+                onCursorPacingUpdated,
                 onTaskCountUpdated,
                 onClientReady, 
                 onRemoteCursorReceived,
@@ -339,10 +348,12 @@ fun RemoteScreenView(
     is3DofEnabled: Boolean,
     streamMode: StreamMode = StreamMode.LOW_LATENCY,
     lastInteractiveInputMs: Long = 0L,
+    lastLocalMoveTime: Long = 0L,
     onStatsUpdated: ((Int, Double, String?, Int) -> Unit)? = null,
     onCaptureMethodUpdated: ((String) -> Unit)? = null,
     onAudioStateUpdated: ((String) -> Unit)? = null,
     onFramePacingUpdated: ((List<Float>) -> Unit)? = null,
+    onCursorPacingUpdated: ((List<Float>) -> Unit)? = null,
     onTaskCountUpdated: ((Int) -> Unit)? = null,
     onClientReady: ((String) -> Unit) -> Unit = {},
     onRemoteCursorReceived: (Float, Float, Int, Int) -> Unit = { _, _, _, _ -> },
@@ -480,6 +491,8 @@ fun RemoteScreenView(
                 latencyEma = 0.0
             }
             val pacingSamples = ArrayDeque<Float>()
+            val cursorPacingSamples = ArrayDeque<Float>()
+            var lastCursorSampleAtMs = Double.NaN
             decoderController.onFrameGapSample = { gapMs ->
                 val snapshot = synchronized(pacingSamples) {
                     pacingSamples.addLast(gapMs.toFloat())
@@ -493,7 +506,61 @@ fun RemoteScreenView(
                 }
             }
 
+            fun handleCursorMessage(json: JSONObject) {
+                val sampleAtMs = when {
+                    json.has("tm") -> json.optDouble("tm", Double.NaN)
+                    json.has("t") -> json.optLong("t", System.currentTimeMillis()).toDouble()
+                    else -> System.currentTimeMillis().toDouble()
+                }
+                if (!lastCursorSampleAtMs.isNaN() && !sampleAtMs.isNaN()) {
+                    val snapshot = synchronized(cursorPacingSamples) {
+                        cursorPacingSamples.addLast((sampleAtMs - lastCursorSampleAtMs).toFloat())
+                        while (cursorPacingSamples.size > FRAME_PACING_SAMPLE_COUNT) {
+                            cursorPacingSamples.removeFirst()
+                        }
+                        cursorPacingSamples.toList()
+                    }
+                    scope.launch(Dispatchers.Main) {
+                        onCursorPacingUpdated?.invoke(snapshot)
+                    }
+                }
+                lastCursorSampleAtMs = sampleAtMs
+                val visible = json.optBoolean("visible", true)
+                val nextCursor = if (visible) {
+                    val cursorBitmap = if (json.has("img")) {
+                        try {
+                            val cursorBytes = Base64.decode(json.getString("img"), Base64.DEFAULT)
+                            BitmapFactory.decodeByteArray(cursorBytes, 0, cursorBytes.size)
+                        } catch (_: Exception) {
+                            cursor?.bitmap
+                        }
+                    } else {
+                        cursor?.bitmap
+                    }
+
+                    RemoteCursorState(
+                        visible = true,
+                        x = json.optDouble("x").toFloat(),
+                        y = json.optDouble("y").toFloat(),
+                        sourceWidth = json.optInt("w", videoConfig?.width ?: 1),
+                        sourceHeight = json.optInt("h", videoConfig?.height ?: 1),
+                        bitmap = cursorBitmap,
+                        hotX = if (json.has("hx")) json.optInt("hx") else (cursor?.hotX ?: 0),
+                        hotY = if (json.has("hy")) json.optInt("hy") else (cursor?.hotY ?: 0)
+                    )
+                } else {
+                    cursor?.copy(visible = false)
+                }
+                nextCursor?.let {
+                    onRemoteCursorReceived(it.x, it.y, it.sourceWidth, it.sourceHeight)
+                }
+                scope.launch(Dispatchers.Main) {
+                    cursor = nextCursor
+                }
+            }
+
             val uri = URI("ws://${machine.host}:${machine.wsPort}")
+            val cursorUri = URI("ws://${machine.host}:${machine.cursorWsPort}")
             val wsClient = object : WebSocketClient(uri) {
                 override fun onOpen(handshakedata: ServerHandshake?) {
                     debugLog(REMOTE_TAG, "Connected")
@@ -603,41 +670,6 @@ fun RemoteScreenView(
                                     debugError(REMOTE_TAG, "Failed to parse audio_config", e)
                                 }
                             }
-                            "cursor" -> {
-                                val visible = json.optBoolean("visible", true)
-                                val nextCursor = if (visible) {
-                                    val cursorBitmap = if (json.has("img")) {
-                                        try {
-                                            val cursorBytes = Base64.decode(json.getString("img"), Base64.DEFAULT)
-                                            BitmapFactory.decodeByteArray(cursorBytes, 0, cursorBytes.size)
-                                        } catch (_: Exception) {
-                                            cursor?.bitmap
-                                        }
-                                    } else {
-                                        cursor?.bitmap
-                                    }
-
-                                    RemoteCursorState(
-                                        visible = true,
-                                        x = json.optDouble("x").toFloat(),
-                                        y = json.optDouble("y").toFloat(),
-                                        sourceWidth = json.optInt("w", videoConfig?.width ?: 1),
-                                        sourceHeight = json.optInt("h", videoConfig?.height ?: 1),
-                                        bitmap = cursorBitmap,
-                                        hotX = if (json.has("hx")) json.optInt("hx") else (cursor?.hotX ?: 0),
-                                        hotY = if (json.has("hy")) json.optInt("hy") else (cursor?.hotY ?: 0)
-                                    )
-                                } else {
-                                    // Even if invisible, keep the last known state but set visible=false
-                                    cursor?.copy(visible = false)
-                                }
-                                nextCursor?.let {
-                                    onRemoteCursorReceived(it.x, it.y, it.sourceWidth, it.sourceHeight)
-                                }
-                                scope.launch(Dispatchers.Main) {
-                                    cursor = nextCursor
-                                }
-                            }
                             "video_config" -> {
                                 val sps = Base64.decode(json.getString("sps"), Base64.DEFAULT)
                                 val pps = Base64.decode(json.getString("pps"), Base64.DEFAULT)
@@ -715,13 +747,43 @@ fun RemoteScreenView(
                     debugError(REMOTE_TAG, "Socket Error", ex)
                 }
             }
-            
+
+            val cursorWsClient = object : WebSocketClient(cursorUri) {
+                override fun onOpen(handshakedata: ServerHandshake?) {
+                    debugLog(REMOTE_TAG, "Cursor socket connected")
+                }
+
+                override fun onMessage(message: String?) {
+                    if (message.isNullOrBlank()) return
+                    try {
+                        val json = JSONObject(message)
+                        if (json.optString("type") == "cursor") {
+                            handleCursorMessage(json)
+                        }
+                    } catch (e: Exception) {
+                        debugError(REMOTE_TAG, "Failed to parse cursor message", e)
+                    }
+                }
+
+                override fun onMessage(bytes: ByteBuffer?) {}
+
+                override fun onClose(code: Int, reason: String?, remote: Boolean) {
+                    debugLog(REMOTE_TAG, "Cursor socket closed: code=$code remote=$remote reason=$reason")
+                }
+
+                override fun onError(ex: Exception?) {
+                    debugError(REMOTE_TAG, "Cursor Socket Error", ex)
+                }
+            }
+             
             wsClient.connect()
+            cursorWsClient.connect()
             client = wsClient
 
             onDispose {
                 debugLog(REMOTE_TAG, "Disconnecting")
                 wsClient.close()
+                cursorWsClient.close()
                 statsJob.cancel()
                 pingJob.cancel()
                 decoderController.release()
@@ -785,7 +847,7 @@ fun RemoteScreenView(
                         },
                         modifier = videoModifier.align(Alignment.Center)
                     )
-                    CursorOverlay(cursor, viewSize, localCursorX, localCursorY)
+                    CursorOverlay(cursor, viewSize, localCursorX, localCursorY, lastLocalMoveTime)
                     
                     if (is3DofEnabled) {
                         ThreeDofVisualizer()
@@ -1135,7 +1197,13 @@ private fun defaultGlassesWireframeModel(): GlassesWireframeModel {
 }
 
 @Composable
-private fun CursorOverlay(cursor: RemoteCursorState?, viewSize: IntSize, localX: Float, localY: Float) {
+private fun CursorOverlay(
+    cursor: RemoteCursorState?,
+    viewSize: IntSize,
+    localX: Float,
+    localY: Float,
+    lastLocalMoveTime: Long
+) {
     val cursorBitmap = cursor?.bitmap
     if (cursorBitmap == null || viewSize.width <= 0 || viewSize.height <= 0) {
         return
@@ -1146,6 +1214,22 @@ private fun CursorOverlay(cursor: RemoteCursorState?, viewSize: IntSize, localX:
         // for the user to find their place after the host hides it.
     }
     val density = LocalDensity.current
+    var preferLocalCursor by remember(lastLocalMoveTime) {
+        mutableStateOf(
+            lastLocalMoveTime > 0L &&
+                System.currentTimeMillis() - lastLocalMoveTime <= LOCAL_CURSOR_PREFERENCE_MS
+        )
+    }
+    LaunchedEffect(lastLocalMoveTime) {
+        val remainingMs = LOCAL_CURSOR_PREFERENCE_MS - (System.currentTimeMillis() - lastLocalMoveTime)
+        if (lastLocalMoveTime > 0L && remainingMs > 0L) {
+            preferLocalCursor = true
+            delay(remainingMs)
+        }
+        preferLocalCursor = false
+    }
+    val displayX = if (preferLocalCursor) localX else cursor.x
+    val displayY = if (preferLocalCursor) localY else cursor.y
 
     val sourceWidth = maxOf(1, cursor.sourceWidth)
     val sourceHeight = maxOf(1, cursor.sourceHeight)
@@ -1154,8 +1238,8 @@ private fun CursorOverlay(cursor: RemoteCursorState?, viewSize: IntSize, localX:
     val drawnHeight = sourceHeight * scale
     val offsetX = (viewSize.width - drawnWidth) / 2f
     val offsetY = (viewSize.height - drawnHeight) / 2f
-    val cursorLeft = offsetX + (localX - cursor.hotX) * scale
-    val cursorTop = offsetY + (localY - cursor.hotY) * scale
+    val cursorLeft = offsetX + (displayX - cursor.hotX) * scale
+    val cursorTop = offsetY + (displayY - cursor.hotY) * scale
     val cursorWidth = (cursorBitmap.width * scale).coerceAtLeast(1f)
     val cursorHeight = (cursorBitmap.height * scale).coerceAtLeast(1f)
     val leftPx = kotlin.math.floor(cursorLeft).toInt()
