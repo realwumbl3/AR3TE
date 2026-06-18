@@ -23,6 +23,7 @@ class ExternalDisplayService : LifecycleService() {
     private var presentation: ExternalDisplayPresentation? = null
     private lateinit var displayManager: DisplayManager
     private var wakeLock: PowerManager.WakeLock? = null
+    private var inAppPreviewSender: ((String) -> Unit)? = null
     
     private var _currentState by mutableStateOf(ExternalDisplayState.IDLE)
     var currentState: ExternalDisplayState
@@ -115,6 +116,9 @@ class ExternalDisplayService : LifecycleService() {
             _openTaskCount = value
         }
 
+    var hasPresentationDisplay by mutableStateOf(false)
+        private set
+
     var taskCountListener: ((Int) -> Unit)? = null
 
     var localCursorX by mutableStateOf(0f)
@@ -151,7 +155,33 @@ class ExternalDisplayService : LifecycleService() {
     }
 
     fun sendRemoteMessage(message: String) {
-        presentation?.onSendMessage?.invoke(message)
+        presentation?.onSendMessage?.invoke(message) ?: inAppPreviewSender?.invoke(message)
+    }
+
+    fun setInAppPreviewSender(sender: ((String) -> Unit)?) {
+        inAppPreviewSender = sender
+    }
+
+    fun updateStreamStats(fps: Int, megabytesPerSecond: Double, captureMethod: String?, latencyMs: Int) {
+        currentFps = fps
+        currentMegabytesPerSecond = megabytesPerSecond
+        currentLatencyMs = latencyMs
+        if (!captureMethod.isNullOrBlank()) {
+            currentCaptureMethod = captureMethod
+        }
+    }
+
+    fun updateCaptureMethod(method: String) {
+        currentCaptureMethod = method
+    }
+
+    fun updateAudioState(state: String) {
+        currentAudioState = state
+    }
+
+    fun updateTaskCount(count: Int) {
+        openTaskCount = count
+        taskCountListener?.invoke(count)
     }
 
     private val displayListener = object : DisplayManager.DisplayListener {
@@ -189,6 +219,7 @@ class ExternalDisplayService : LifecycleService() {
 
     private fun updatePresentation() {
         val displays = displayManager.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION)
+        hasPresentationDisplay = displays.isNotEmpty()
         if (displays.isNotEmpty()) {
             val display = displays[0]
             if (presentation == null || presentation?.display != display) {
@@ -201,22 +232,16 @@ class ExternalDisplayService : LifecycleService() {
                     localCursorX = this@ExternalDisplayService.localCursorX
                     localCursorY = this@ExternalDisplayService.localCursorY
                     onStatsUpdated = { f, megabytesPerSecond, method, latencyMs ->
-                        currentFps = f
-                        currentMegabytesPerSecond = megabytesPerSecond
-                        currentLatencyMs = latencyMs
-                        if (!method.isNullOrBlank()) {
-                            currentCaptureMethod = method
-                        }
+                        updateStreamStats(f, megabytesPerSecond, method, latencyMs)
                     }
                     onCaptureMethodUpdated = { method ->
-                        currentCaptureMethod = method
+                        updateCaptureMethod(method)
                     }
                     onAudioStateUpdated = { state ->
-                        currentAudioState = state
+                        updateAudioState(state)
                     }
                     onTaskCountUpdated = { count ->
-                        openTaskCount = count
-                        taskCountListener?.invoke(count)
+                        updateTaskCount(count)
                     }
                     onRemoteCursorReceived = { x, y, w, h ->
                         syncLocalCursorFromRemote(x, y, w, h)

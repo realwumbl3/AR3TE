@@ -25,6 +25,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.input.pointer.changedToUp
@@ -191,10 +192,14 @@ class MainActivity : ComponentActivity() {
                             openTaskCount = openTaskCount,
                             isPointerCaptured = isPointerCaptured,
                             is3DofEnabled = is3DofEnabled,
+                            showEmbeddedPreview = externalDisplayService?.hasPresentationDisplay != true,
+                            previewCursorX = externalDisplayService?.localCursorX ?: 0f,
+                            previewCursorY = externalDisplayService?.localCursorY ?: 0f,
                             onStop = { 
                                 activeMachine = null
                                 externalDisplayService?.activeMachine = null
                                 externalDisplayService?.currentState = ExternalDisplayState.IDLE
+                                externalDisplayService?.setInAppPreviewSender(null)
                                 isPointerCaptured = false
                                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                                     window.decorView.releasePointerCapture()
@@ -208,6 +213,29 @@ class MainActivity : ComponentActivity() {
                             },
                             onMoveCursor = { dx, dy ->
                                 externalDisplayService?.updateLocalCursor(dx, dy)
+                            },
+                            onPreviewClientReady = { sender ->
+                                externalDisplayService?.setInAppPreviewSender(sender)
+                            },
+                            onPreviewStatsUpdated = { fps, megabytesPerSecond, captureMethod, latencyMs ->
+                                externalDisplayService?.updateStreamStats(
+                                    fps = fps,
+                                    megabytesPerSecond = megabytesPerSecond,
+                                    captureMethod = captureMethod,
+                                    latencyMs = latencyMs
+                                )
+                            },
+                            onPreviewCaptureMethodUpdated = { method ->
+                                externalDisplayService?.updateCaptureMethod(method)
+                            },
+                            onPreviewAudioStateUpdated = { state ->
+                                externalDisplayService?.updateAudioState(state)
+                            },
+                            onPreviewTaskCountUpdated = { count ->
+                                externalDisplayService?.updateTaskCount(count)
+                            },
+                            onPreviewRemoteCursorReceived = { x, y, w, h ->
+                                externalDisplayService?.syncLocalCursorFromRemote(x, y, w, h)
                             },
                             onCapturedMouseEvent = { event ->
                                 activeMachine != null && isPointerCaptured && handleMouseMotionEvent(event)
@@ -451,10 +479,19 @@ fun ScreenSharingScreen(
     openTaskCount: Int,
     isPointerCaptured: Boolean,
     is3DofEnabled: Boolean,
+    showEmbeddedPreview: Boolean,
+    previewCursorX: Float,
+    previewCursorY: Float,
     onStop: () -> Unit,
     onMonitorSwitch: (Int) -> Unit,
     onSendMessage: (String) -> Unit,
     onMoveCursor: (Float, Float) -> Unit,
+    onPreviewClientReady: ((String) -> Unit) -> Unit,
+    onPreviewStatsUpdated: (Int, Double, String?, Int) -> Unit,
+    onPreviewCaptureMethodUpdated: (String) -> Unit,
+    onPreviewAudioStateUpdated: (String) -> Unit,
+    onPreviewTaskCountUpdated: (Int) -> Unit,
+    onPreviewRemoteCursorReceived: (Float, Float, Int, Int) -> Unit,
     onCapturedMouseEvent: (MotionEvent) -> Boolean,
     onCaptureToggle: (Boolean) -> Unit,
     on3DofToggle: (Boolean) -> Unit,
@@ -701,6 +738,33 @@ fun ScreenSharingScreen(
         }
 
         Spacer(modifier = Modifier.height(8.dp))
+
+        if (showEmbeddedPreview) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(16f / 9f),
+                colors = CardDefaults.cardColors(
+                    containerColor = Color.Black
+                )
+            ) {
+                RemoteScreenView(
+                    machine = machine,
+                    monitorIndex = monitorIndex,
+                    is3DofEnabled = is3DofEnabled,
+                    onStatsUpdated = onPreviewStatsUpdated,
+                    onCaptureMethodUpdated = onPreviewCaptureMethodUpdated,
+                    onAudioStateUpdated = onPreviewAudioStateUpdated,
+                    onTaskCountUpdated = onPreviewTaskCountUpdated,
+                    onClientReady = onPreviewClientReady,
+                    onRemoteCursorReceived = onPreviewRemoteCursorReceived,
+                    localCursorX = previewCursorX,
+                    localCursorY = previewCursorY
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+        }
 
         // Trackpad Area
         Card(
