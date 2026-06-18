@@ -25,6 +25,10 @@ namespace RemoteDesktop {
         private static string lastCursorBase64 = "";
         private static int lastCursorHotX = 0;
         private static int lastCursorHotY = 0;
+        private static int lastCursorSourceWidth = 0;
+        private static int lastCursorSourceHeight = 0;
+        private static int lastCursorMonitorWidth = 0;
+        private static int lastCursorMonitorHeight = 0;
         private static string lastCursorMetadataJson = "";
 
         private sealed class MonitorProbeInfo {
@@ -610,10 +614,16 @@ namespace RemoteDesktop {
             string cursorBase64 = null;
             ICONINFO iconInfo;
             if (GetIconInfo(cursorHandle, out iconInfo)) {
-                hotX = monitorWidth > 0 ? (int)Math.Round((double)iconInfo.xHotspot * sourceWidth / monitorWidth) : iconInfo.xHotspot;
-                hotY = monitorHeight > 0 ? (int)Math.Round((double)iconInfo.yHotspot * sourceHeight / monitorHeight) : iconInfo.yHotspot;
+                hotX = iconInfo.xHotspot;
+                hotY = iconInfo.yHotspot;
 
-                if (cursorHandle != lastCursorHandle || string.IsNullOrEmpty(lastCursorBase64)) {
+                bool cursorScaleChanged =
+                    sourceWidth != lastCursorSourceWidth ||
+                    sourceHeight != lastCursorSourceHeight ||
+                    monitorWidth != lastCursorMonitorWidth ||
+                    monitorHeight != lastCursorMonitorHeight;
+
+                if (cursorHandle != lastCursorHandle || string.IsNullOrEmpty(lastCursorBase64) || cursorScaleChanged) {
                     Bitmap cursorBitmap = null;
                     try {
                         cursorBitmap = Bitmap.FromHicon(cursorHandle);
@@ -637,6 +647,14 @@ namespace RemoteDesktop {
 
                     if (cursorBitmap != null) {
                         try {
+                            cursorBitmap = NormalizeCursorBitmap(
+                                cursorBitmap,
+                                monitorWidth,
+                                monitorHeight,
+                                sourceWidth,
+                                sourceHeight,
+                                ref hotX,
+                                ref hotY);
                             using (MemoryStream ms = new MemoryStream()) {
                                 cursorBitmap.Save(ms, ImageFormat.Png);
                                 cursorBase64 = Convert.ToBase64String(ms.ToArray());
@@ -644,6 +662,10 @@ namespace RemoteDesktop {
                                 lastCursorBase64 = cursorBase64;
                                 lastCursorHotX = hotX;
                                 lastCursorHotY = hotY;
+                                lastCursorSourceWidth = sourceWidth;
+                                lastCursorSourceHeight = sourceHeight;
+                                lastCursorMonitorWidth = monitorWidth;
+                                lastCursorMonitorHeight = monitorHeight;
                             }
                         } catch {
                             cursorBase64 = null;
@@ -699,6 +721,118 @@ namespace RemoteDesktop {
                 Console.Error.WriteLine("CURSOR " + json);
                 Console.Error.Flush();
             } catch { }
+        }
+
+        private static Bitmap NormalizeCursorBitmap(
+            Bitmap source,
+            int monitorWidth,
+            int monitorHeight,
+            int sourceWidth,
+            int sourceHeight,
+            ref int hotX,
+            ref int hotY) {
+            Bitmap cropped = CropCursorBitmap(source, ref hotX, ref hotY);
+            if (ReferenceEquals(cropped, source) == false) {
+                source.Dispose();
+                source = cropped;
+            }
+
+            if (monitorWidth <= 0 || monitorHeight <= 0 || sourceWidth <= 0 || sourceHeight <= 0) {
+                return source;
+            }
+
+            double scaleX = (double)sourceWidth / monitorWidth;
+            double scaleY = (double)sourceHeight / monitorHeight;
+            int scaledWidth = Math.Max(1, (int)Math.Round(source.Width * scaleX));
+            int scaledHeight = Math.Max(1, (int)Math.Round(source.Height * scaleY));
+            hotX = Math.Max(0, (int)Math.Round(hotX * scaleX));
+            hotY = Math.Max(0, (int)Math.Round(hotY * scaleY));
+
+            if (scaledWidth == source.Width && scaledHeight == source.Height) {
+                return source;
+            }
+
+            Bitmap scaled = new Bitmap(scaledWidth, scaledHeight, PixelFormat.Format32bppArgb);
+            using (Graphics g = Graphics.FromImage(scaled)) {
+                g.Clear(Color.Transparent);
+                g.CompositingMode = CompositingMode.SourceCopy;
+                g.CompositingQuality = CompositingQuality.HighQuality;
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                using (ImageAttributes attrs = new ImageAttributes()) {
+                    attrs.SetWrapMode(WrapMode.TileFlipXY);
+                    g.DrawImage(
+                        source,
+                        new Rectangle(0, 0, scaledWidth, scaledHeight),
+                        0,
+                        0,
+                        source.Width,
+                        source.Height,
+                        GraphicsUnit.Pixel,
+                        attrs);
+                }
+            }
+            source.Dispose();
+            return scaled;
+        }
+
+        private static Bitmap CropCursorBitmap(Bitmap source, ref int hotX, ref int hotY) {
+            Rectangle bounds = FindNonTransparentBounds(source);
+            if (bounds.Width <= 0 || bounds.Height <= 0) {
+                return source;
+            }
+
+            if (bounds.X == 0 && bounds.Y == 0 && bounds.Width == source.Width && bounds.Height == source.Height) {
+                return source;
+            }
+
+            Bitmap cropped = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppArgb);
+            using (Graphics g = Graphics.FromImage(cropped)) {
+                g.Clear(Color.Transparent);
+                g.CompositingMode = CompositingMode.SourceCopy;
+                g.DrawImage(
+                    source,
+                    new Rectangle(0, 0, bounds.Width, bounds.Height),
+                    bounds,
+                    GraphicsUnit.Pixel);
+            }
+            hotX = Math.Max(0, hotX - bounds.X);
+            hotY = Math.Max(0, hotY - bounds.Y);
+            return cropped;
+        }
+
+        private static Rectangle FindNonTransparentBounds(Bitmap bitmap) {
+            Rectangle rect = new Rectangle(0, 0, bitmap.Width, bitmap.Height);
+            BitmapData data = bitmap.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            try {
+                int minX = bitmap.Width;
+                int minY = bitmap.Height;
+                int maxX = -1;
+                int maxY = -1;
+
+                unsafe {
+                    byte* basePtr = (byte*)data.Scan0;
+                    for (int y = 0; y < bitmap.Height; y++) {
+                        byte* row = basePtr + (y * data.Stride);
+                        for (int x = 0; x < bitmap.Width; x++) {
+                            byte alpha = row[x * 4 + 3];
+                            if (alpha == 0) continue;
+                            if (x < minX) minX = x;
+                            if (y < minY) minY = y;
+                            if (x > maxX) maxX = x;
+                            if (y > maxY) maxY = y;
+                        }
+                    }
+                }
+
+                if (maxX < minX || maxY < minY) {
+                    return new Rectangle(0, 0, bitmap.Width, bitmap.Height);
+                }
+
+                return Rectangle.FromLTRB(minX, minY, maxX + 1, maxY + 1);
+            } finally {
+                bitmap.UnlockBits(data);
+            }
         }
 
         private static unsafe void CopyBitmapRegion(Bitmap source, Bitmap dest) {

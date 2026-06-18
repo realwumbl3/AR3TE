@@ -1857,6 +1857,26 @@ startInputProcess();
 const server = http.createServer();
 wss = new WebSocketServer({ server, perMessageDeflate: false });
 
+function handleWebSocketBindError(error) {
+  if (error.code === "EADDRINUSE" && wsBindAttempts < 5) {
+    console.warn(`Port ${WS_PORT} is busy, retrying WebSocket bind...`);
+    killExistingInstances();
+    try {
+      server.close();
+    } catch {
+      // Server may already be closing or closed.
+    }
+    const retryDelay = Math.min(1000, 200 * wsBindAttempts);
+    setTimeout(bindWebSocketServer, retryDelay);
+    return;
+  }
+
+  console.error(error.code === "EADDRINUSE" ? `Port ${WS_PORT} is already in use.` : error);
+  process.exit(1);
+}
+
+wss.on("error", handleWebSocketBindError);
+
 wss.on("connection", (ws) => {
   if (ws._socket?.setNoDelay) {
     ws._socket.setNoDelay(true);
@@ -1959,23 +1979,7 @@ function bindWebSocketServer() {
   server.listen(WS_PORT);
 }
 
-server.on("error", (error) => {
-  if (error.code === "EADDRINUSE" && wsBindAttempts < 5) {
-    console.warn(`Port ${WS_PORT} is busy, retrying WebSocket bind...`);
-    killExistingInstances();
-    try {
-      server.close();
-    } catch {
-      // Server may already be closing or closed.
-    }
-    const retryDelay = Math.min(1000, 200 * wsBindAttempts);
-    setTimeout(bindWebSocketServer, retryDelay);
-    return;
-  }
-
-  console.error(error.code === "EADDRINUSE" ? `Port ${WS_PORT} is already in use.` : error);
-  process.exit(1);
-});
+server.on("error", handleWebSocketBindError);
 
 bindWebSocketServer();
 

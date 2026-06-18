@@ -24,12 +24,15 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
@@ -48,8 +51,10 @@ import com.ar3te.discovery.DiscoveredMachine
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.painter.BitmapPainter
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
@@ -658,23 +663,36 @@ fun RemoteScreenView(
                     )
                 }
             } else {
-                Box(
+                BoxWithConstraints(
                     modifier = Modifier
                         .fillMaxSize()
                         .onSizeChanged { viewSize = it }
                 ) {
+                    val streamAspect = videoConfig!!.width.toFloat() / videoConfig!!.height.toFloat()
+                    val containerAspect = if (maxHeight > 0.dp) maxWidth / maxHeight else streamAspect
+                    val videoModifier = if (containerAspect > streamAspect) {
+                        Modifier
+                            .fillMaxHeight()
+                            .aspectRatio(streamAspect)
+                    } else {
+                        Modifier
+                            .fillMaxWidth()
+                            .aspectRatio(streamAspect)
+                    }
                     AndroidView(
                         factory = { context ->
                             SurfaceView(context).apply {
                                 keepScreenOn = true
+                                holder.setFixedSize(videoConfig!!.width, videoConfig!!.height)
                                 holder.addCallback(decoderController)
                                 decoderController.bindSurface(holder)
                             }
                         },
                         update = { view ->
+                            view.holder.setFixedSize(videoConfig!!.width, videoConfig!!.height)
                             decoderController.bindSurface(view.holder)
                         },
-                        modifier = Modifier.fillMaxSize()
+                        modifier = videoModifier.align(Alignment.Center)
                     )
                     CursorOverlay(cursor, viewSize, localCursorX, localCursorY)
                     
@@ -1049,16 +1067,29 @@ private fun CursorOverlay(cursor: RemoteCursorState?, viewSize: IntSize, localX:
     val cursorTop = offsetY + (localY - cursor.hotY) * scale
     val cursorWidth = (cursorBitmap.width * scale).coerceAtLeast(1f)
     val cursorHeight = (cursorBitmap.height * scale).coerceAtLeast(1f)
+    val leftPx = kotlin.math.floor(cursorLeft).toInt()
+    val topPx = kotlin.math.floor(cursorTop).toInt()
+    val rightPx = kotlin.math.ceil(cursorLeft + cursorWidth).toInt()
+    val bottomPx = kotlin.math.ceil(cursorTop + cursorHeight).toInt()
+    val drawWidthPx = (rightPx - leftPx).coerceAtLeast(1)
+    val drawHeightPx = (bottomPx - topPx).coerceAtLeast(1)
+
+    val scaledCursorBitmap = remember(cursorBitmap, drawWidthPx, drawHeightPx) {
+        cursorBitmap.setHasMipMap(true)
+        Bitmap.createScaledBitmap(cursorBitmap, drawWidthPx, drawHeightPx, true)
+    }
 
     Image(
-        bitmap = cursorBitmap.asImageBitmap(),
+        painter = BitmapPainter(
+            image = scaledCursorBitmap.asImageBitmap(),
+            filterQuality = FilterQuality.None
+        ),
         contentDescription = "Remote cursor",
-        contentScale = ContentScale.FillBounds,
         modifier = Modifier
-            .offset { IntOffset(cursorLeft.roundToInt(), cursorTop.roundToInt()) }
+            .offset { IntOffset(leftPx, topPx) }
             .size(
-                width = with(density) { cursorWidth.toDp() },
-                height = with(density) { cursorHeight.toDp() }
+                width = with(density) { drawWidthPx.toDp() },
+                height = with(density) { drawHeightPx.toDp() }
             )
     )
 }
@@ -1202,6 +1233,7 @@ class H264StreamController(
             val decoder = MediaCodec.createDecoderByType("video/avc")
             decoder.configure(format, targetSurface, null, 0)
             decoder.start()
+            decoder.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT)
             synchronized(codecLock) {
                 codec = decoder
                 nextPtsUs = 0L
