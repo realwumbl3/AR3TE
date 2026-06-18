@@ -11,6 +11,11 @@
     <string name="debug">Debug</string>
     <string name="debug_menu_title">Debug Menu</string>
     <string name="enable_3dof_view">Enable 3DOF View (Rayneo Air 3S Pro)</string>
+    <string name="streaming_mode_title">Streaming Mode</string>
+    <string name="streaming_mode_summary">Low latency is the default and keeps interaction responsive by dropping stale frames when needed.</string>
+    <string name="streaming_mode_auto">Auto</string>
+    <string name="streaming_mode_low_latency">Low latency</string>
+    <string name="streaming_mode_smooth_buffered">Smooth buffered</string>
     <string name="trackpad_captured">POINTER CAPTURED</string>
     <string name="trackpad_idle">VIRTUAL TRACKPAD</string>
     <string name="task_switcher_label">Task Switcher</string>

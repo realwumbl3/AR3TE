@@ -42,6 +42,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
@@ -68,6 +69,7 @@ import androidx.lifecycle.Lifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -96,11 +98,23 @@ enum class ExternalDisplayState {
     IDLE, REMOTE_SCREEN
 }
 
+enum class StreamMode(val wireValue: String) {
+    AUTO("auto"),
+    LOW_LATENCY("low_latency"),
+    SMOOTH_BUFFERED("smooth_buffered");
+
+    companion object {
+        fun fromWireValue(value: String?): StreamMode =
+            entries.firstOrNull { it.wireValue == value } ?: LOW_LATENCY
+    }
+}
+
 private const val REMOTE_TAG = "RemoteScreenView"
 private const val H264_TAG = "H264StreamController"
 private const val VIDEO_TIMESTAMP_BYTES = 8
 private const val VIDEO_HEADER_BYTES = 1 + VIDEO_TIMESTAMP_BYTES
 private const val ENABLE_DEBUG_LOGS = false
+private const val AUTO_MODE_COOLDOWN_MS = 3_000L
 
 private fun debugLog(tag: String, message: String) {
     if (!ENABLE_DEBUG_LOGS) {
@@ -187,6 +201,8 @@ class ExternalDisplayPresentation(
     var activeMachine by mutableStateOf<DiscoveredMachine?>(null)
     var monitorIndex by mutableIntStateOf(1)
     var is3DofEnabled by mutableStateOf(false)
+    var streamMode by mutableStateOf(StreamMode.LOW_LATENCY)
+    var lastInteractiveInputMs by mutableLongStateOf(0L)
     var onStatsUpdated: ((Int, Double, String?, Int) -> Unit)? = null
     var onCaptureMethodUpdated: ((String) -> Unit)? = null
     var onAudioStateUpdated: ((String) -> Unit)? = null
@@ -219,6 +235,8 @@ class ExternalDisplayPresentation(
                     activeMachine, 
                     monitorIndex, 
                     is3DofEnabled,
+                    streamMode,
+                    lastInteractiveInputMs,
                     onStatsUpdated, 
                     onCaptureMethodUpdated, 
                     onAudioStateUpdated,
@@ -251,6 +269,8 @@ fun ExternalDisplayScreen(
     machine: DiscoveredMachine? = null,
     monitorIndex: Int = 1,
     is3DofEnabled: Boolean = false,
+    streamMode: StreamMode = StreamMode.LOW_LATENCY,
+    lastInteractiveInputMs: Long = 0L,
     onStatsUpdated: ((Int, Double, String?, Int) -> Unit)? = null,
     onCaptureMethodUpdated: ((String) -> Unit)? = null,
     onAudioStateUpdated: ((String) -> Unit)? = null,
@@ -267,6 +287,8 @@ fun ExternalDisplayScreen(
                 machine, 
                 monitorIndex, 
                 is3DofEnabled,
+                streamMode,
+                lastInteractiveInputMs,
                 onStatsUpdated, 
                 onCaptureMethodUpdated, 
                 onAudioStateUpdated,
@@ -309,6 +331,8 @@ fun RemoteScreenView(
     machine: DiscoveredMachine?,
     monitorIndex: Int,
     is3DofEnabled: Boolean,
+    streamMode: StreamMode = StreamMode.LOW_LATENCY,
+    lastInteractiveInputMs: Long = 0L,
     onStatsUpdated: ((Int, Double, String?, Int) -> Unit)? = null,
     onCaptureMethodUpdated: ((String) -> Unit)? = null,
     onAudioStateUpdated: ((String) -> Unit)? = null,
@@ -321,6 +345,14 @@ fun RemoteScreenView(
     val scope = rememberCoroutineScope()
     val machineHost = machine?.host
     var client by remember(machineHost) { mutableStateOf<WebSocketClient?>(null) }
+    var effectiveStreamMode by remember(machineHost, streamMode) {
+        mutableStateOf(
+            when (streamMode) {
+                StreamMode.AUTO -> StreamMode.SMOOTH_BUFFERED
+                else -> streamMode
+            }
+        )
+    }
     
     LaunchedEffect(client) {
         onClientReady { msg -> 
@@ -341,18 +373,49 @@ fun RemoteScreenView(
             }
         }
     }
+    LaunchedEffect(streamMode, lastInteractiveInputMs, machineHost) {
+        if (streamMode != StreamMode.AUTO) {
+            effectiveStreamMode = streamMode
+            return@LaunchedEffect
+        }
+        val now = System.currentTimeMillis()
+        val remainingMs = AUTO_MODE_COOLDOWN_MS - (now - lastInteractiveInputMs)
+        if (lastInteractiveInputMs > 0L && remainingMs > 0L) {
+            val interactionToken = lastInteractiveInputMs
+            effectiveStreamMode = StreamMode.LOW_LATENCY
+            delay(remainingMs)
+            if (streamMode == StreamMode.AUTO && lastInteractiveInputMs == interactionToken) {
+                effectiveStreamMode = StreamMode.SMOOTH_BUFFERED
+            }
+        } else {
+            effectiveStreamMode = StreamMode.SMOOTH_BUFFERED
+        }
+    }
+    LaunchedEffect(client, effectiveStreamMode) {
+        client?.let {
+            if (it.isOpen) {
+                it.send(JSONObject().apply {
+                    put("type", "set_stream_mode")
+                    put("value", effectiveStreamMode.wireValue)
+                }.toString())
+            }
+        }
+    }
     var videoConfig by remember(machineHost) { mutableStateOf<H264StreamConfig?>(null) }
     var captureMethod by remember(machineHost) { mutableStateOf<String?>(null) }
     var cursor by remember(machineHost) { mutableStateOf<RemoteCursorState?>(null) }
     var viewSize by remember(machineHost) { mutableStateOf(IntSize.Zero) }
     val decoderController = remember(machineHost) { H264StreamController(scope) }
     val audioController = remember(machineHost) { PcmAudioController(scope) }
+    LaunchedEffect(effectiveStreamMode) {
+        decoderController.streamMode = effectiveStreamMode
+    }
 
     DisposableEffect(machineHost) {
         if (machine == null) {
             onDispose {}
         } else {
-            debugLog(REMOTE_TAG, "Connecting to ws://${machine.host}:${machine.wsPort}")
+            debugLog(REMOTE_TAG, "Connecting to ws://${machine.host}:${machine.wsPort} mode=${effectiveStreamMode.wireValue}")
 
             var frameCount = 0
             var byteCount = 0L
@@ -405,6 +468,10 @@ fun RemoteScreenView(
                 }
                 hasLatency = true
             }
+            decoderController.onCatchUp = {
+                hasLatency = false
+                latencyEma = 0.0
+            }
 
             val uri = URI("ws://${machine.host}:${machine.wsPort}")
             val wsClient = object : WebSocketClient(uri) {
@@ -413,6 +480,10 @@ fun RemoteScreenView(
                     send(JSONObject().apply {
                         put("type", "set_monitor")
                         put("value", monitorIndex)
+                    }.toString())
+                    send(JSONObject().apply {
+                        put("type", "set_stream_mode")
+                        put("value", effectiveStreamMode.wireValue)
                     }.toString())
                     val sentAt = System.currentTimeMillis()
                     pendingPings[1L] = sentAt
@@ -1136,6 +1207,9 @@ class H264StreamController(
     private var lastRenderMs = 0L
     var clockOffsetMs: () -> Long = { 0L }
     var onLatencySample: ((Double) -> Unit)? = null
+    var onCatchUp: (() -> Unit)? = null
+    @Volatile
+    var streamMode: StreamMode = StreamMode.LOW_LATENCY
 
     fun configure(config: H264StreamConfig) {
         debugLog(H264_TAG, "configure: ${config.width}x${config.height} fps=${config.fps} encoder=${config.encoder}")
@@ -1160,6 +1234,14 @@ class H264StreamController(
             debugLog(H264_TAG, "Keyframe received, starting decode queue")
         }
         frameQueue.trySend(TimestampedFrame(frame, captureMs))
+    }
+
+    private fun noteCatchUp(reason: String, droppedCount: Int) {
+        if (droppedCount <= 0) {
+            return
+        }
+        debugLog(H264_TAG, "catch-up mode=$streamMode reason=$reason dropped=$droppedCount")
+        onCatchUp?.invoke()
     }
 
     fun bindSurface(holder: SurfaceHolder) {
@@ -1316,9 +1398,32 @@ class H264StreamController(
                 inflightCaptureTimes.removeFirst()
             }
         }
+        var dropped = 0
         synchronized(outputLock) {
+            if (streamMode == StreamMode.LOW_LATENCY) {
+                while (readyOutputs.size >= MAX_READY_FRAMES_LOW_LATENCY) {
+                    val stale = readyOutputs.removeFirst()
+                    try {
+                        val decoder = synchronized(codecLock) { codec }
+                        decoder?.releaseOutputBuffer(stale.bufferIndex, false)
+                    } catch (_: Exception) {
+                    }
+                    dropped += 1
+                }
+            } else {
+                while (readyOutputs.size >= MAX_READY_FRAMES_SMOOTH_BUFFERED) {
+                    val stale = readyOutputs.removeFirst()
+                    try {
+                        val decoder = synchronized(codecLock) { codec }
+                        decoder?.releaseOutputBuffer(stale.bufferIndex, false)
+                    } catch (_: Exception) {
+                    }
+                    dropped += 1
+                }
+            }
             readyOutputs.addLast(ReadyOutput(bufferIndex, captureMs))
         }
+        noteCatchUp("ready_outputs", dropped)
         requestVsyncRelease()
     }
 
@@ -1345,10 +1450,18 @@ class H264StreamController(
         }
 
         val outputs = synchronized(outputLock) {
-            val backlog = readyOutputs.size
-            val releaseCount = if (backlog > MAX_READY_FRAMES) 2 else 1
-            buildList {
-                repeat(releaseCount.coerceAtMost(readyOutputs.size)) {
+            buildList<ReadyOutput> {
+                if (streamMode == StreamMode.LOW_LATENCY && readyOutputs.isNotEmpty()) {
+                    while (readyOutputs.size > 1) {
+                        readyOutputs.pollFirst()?.let { stale ->
+                            try {
+                                decoder.releaseOutputBuffer(stale.bufferIndex, false)
+                            } catch (_: Exception) {
+                            }
+                        }
+                    }
+                    readyOutputs.pollFirst()?.let { add(it) }
+                } else {
                     readyOutputs.pollFirst()?.let { add(it) }
                 }
             }
@@ -1521,7 +1634,8 @@ class H264StreamController(
     private data class ReadyOutput(val bufferIndex: Int, val captureMs: Long? = null)
 
     companion object {
-        private const val MAX_READY_FRAMES = 2
+        private const val MAX_READY_FRAMES_LOW_LATENCY = 2
+        private const val MAX_READY_FRAMES_SMOOTH_BUFFERED = 4
     }
 }
 

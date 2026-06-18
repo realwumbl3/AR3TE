@@ -13,6 +13,7 @@ import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LifecycleService
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -74,6 +75,14 @@ class ExternalDisplayService : LifecycleService() {
             presentation?.is3DofEnabled = value
         }
 
+    private var _streamMode by mutableStateOf(StreamMode.LOW_LATENCY)
+    var streamMode: StreamMode
+        get() = _streamMode
+        set(value) {
+            _streamMode = value
+            presentation?.streamMode = value
+        }
+
     private var _currentFps by mutableIntStateOf(0)
     var currentFps: Int
         get() = _currentFps
@@ -120,6 +129,8 @@ class ExternalDisplayService : LifecycleService() {
         private set
 
     var taskCountListener: ((Int) -> Unit)? = null
+    var lastInteractiveInputMs by mutableLongStateOf(0L)
+        private set
 
     var localCursorX by mutableStateOf(0f)
     var localCursorY by mutableStateOf(0f)
@@ -155,7 +166,23 @@ class ExternalDisplayService : LifecycleService() {
     }
 
     fun sendRemoteMessage(message: String) {
+        noteInteractiveInput(message)
         presentation?.onSendMessage?.invoke(message) ?: inAppPreviewSender?.invoke(message)
+    }
+
+    private fun noteInteractiveInput(message: String) {
+        if (_streamMode != StreamMode.AUTO) {
+            return
+        }
+        val type = try {
+            org.json.JSONObject(message).optString("type")
+        } catch (_: Exception) {
+            null
+        }
+        if (type in INTERACTIVE_MESSAGE_TYPES) {
+            lastInteractiveInputMs = System.currentTimeMillis()
+            presentation?.lastInteractiveInputMs = lastInteractiveInputMs
+        }
     }
 
     fun setInAppPreviewSender(sender: ((String) -> Unit)?) {
@@ -229,6 +256,8 @@ class ExternalDisplayService : LifecycleService() {
                     activeMachine = _activeMachine
                     monitorIndex = _monitorIndex
                     is3DofEnabled = _is3DofEnabled
+                    streamMode = _streamMode
+                    lastInteractiveInputMs = this@ExternalDisplayService.lastInteractiveInputMs
                     localCursorX = this@ExternalDisplayService.localCursorX
                     localCursorY = this@ExternalDisplayService.localCursorY
                     onStatsUpdated = { f, megabytesPerSecond, method, latencyMs ->
@@ -286,5 +315,15 @@ class ExternalDisplayService : LifecycleService() {
     companion object {
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "external_display_channel"
+        private val INTERACTIVE_MESSAGE_TYPES = setOf(
+            "mouse_move",
+            "mouse_move_abs",
+            "mouse_down",
+            "mouse_up",
+            "mouse_wheel",
+            "key_down",
+            "key_up",
+            "task_switcher"
+        )
     }
 }

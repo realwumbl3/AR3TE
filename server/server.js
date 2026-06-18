@@ -16,6 +16,8 @@ const AUDIO_BINARY_TYPE = 2;
 const AUDIO_SAMPLE_RATE = 48000;
 const AUDIO_CHANNELS = 2;
 const AUDIO_FRAME_DURATION_MS = 20;
+const STREAM_MODE_LOW_LATENCY = "low_latency";
+const STREAM_MODE_SMOOTH_BUFFERED = "smooth_buffered";
 const AUDIO_DEVICE_CANDIDATES = [
   process.env.AR3TE_AUDIO_DEVICE,
   "virtual-audio-capturer",
@@ -378,6 +380,7 @@ let lastCursorMessage = null;
 let currentCaptureMethod = "";
 let directCaptureAllowed = true;
 let wss = null;
+let activeStreamMode = STREAM_MODE_LOW_LATENCY;
 const DEBUG_PACING = process.env.AR3TE_DEBUG_PACING !== "0";
 const TARGET_FRAME_INTERVAL_MS = 1000 / 60;
 let videoSendQueue = [];
@@ -393,7 +396,45 @@ let pacingStats = {
   minGapMs: Number.POSITIVE_INFINITY,
   gapSumMs: 0,
   gapCount: 0,
+  replacedFrames: 0,
 };
+
+function getVideoBacklogCount() {
+  return activeStreamMode === STREAM_MODE_LOW_LATENCY ? 0 : videoSendQueue.length;
+}
+
+function resendCurrentVideoState(ws = null) {
+  const targets = ws ? [ws] : Array.from(wss?.clients || []);
+  for (const client of targets) {
+    if (client.readyState !== 1) {
+      continue;
+    }
+    if (lastVideoConfig) {
+      client.send(JSON.stringify(lastVideoConfig));
+    }
+    if (lastKeyframe) {
+      client.send(lastKeyframe);
+    }
+    if (lastCursorMessage) {
+      client.send(lastCursorMessage);
+    }
+  }
+}
+
+function applyStreamMode(nextMode) {
+  const normalized = nextMode === STREAM_MODE_SMOOTH_BUFFERED
+    ? STREAM_MODE_SMOOTH_BUFFERED
+    : STREAM_MODE_LOW_LATENCY;
+  if (normalized === activeStreamMode) {
+    return;
+  }
+  activeStreamMode = normalized;
+  console.log(`[pacing] switched mode=${activeStreamMode}`);
+  resetPacingStats();
+  resetVideoSendPacer();
+  sendStreamReset();
+  resendCurrentVideoState();
+}
 
 function findExecutable(candidates) {
   for (const candidate of candidates) {
@@ -714,6 +755,11 @@ function resetVideoSendPacer() {
 }
 
 function enqueueVideoFrame(frame, capturedAtMs = Date.now()) {
+  if (activeStreamMode === STREAM_MODE_LOW_LATENCY || activeStreamMode === STREAM_MODE_SMOOTH_BUFFERED) {
+    lastVideoSendMs = Date.now();
+    sendBinaryImmediate(frame, capturedAtMs);
+    return;
+  }
   videoSendQueue.push({ frame, capturedAtMs });
   if (videoSendTimer) {
     return;
@@ -729,15 +775,16 @@ function enqueueVideoFrame(frame, capturedAtMs = Date.now()) {
 
 function flushOneVideoFrame() {
   if (videoSendQueue.length === 0) {
-    return;
+    return false;
   }
   const item = videoSendQueue.shift();
   lastVideoSendMs = Date.now();
   sendBinaryImmediate(item.frame, item.capturedAtMs);
+  return true;
 }
 
 function scheduleVideoSend() {
-  if (videoSendTimer || videoSendQueue.length === 0) {
+  if (videoSendTimer || getVideoBacklogCount() === 0) {
     return;
   }
   const delay = Math.max(0, nextVideoSendAt - performance.now());
@@ -746,12 +793,15 @@ function scheduleVideoSend() {
 
 function fireVideoSend() {
   videoSendTimer = null;
-  if (videoSendQueue.length === 0) {
+  if (getVideoBacklogCount() === 0) {
     nextVideoSendAt = 0;
     return;
   }
 
-  flushOneVideoFrame();
+  if (!flushOneVideoFrame()) {
+    nextVideoSendAt = 0;
+    return;
+  }
 
   const now = performance.now();
   if (nextVideoSendAt === 0) {
@@ -764,7 +814,7 @@ function fireVideoSend() {
     nextVideoSendAt = now + TARGET_FRAME_INTERVAL_MS;
   }
 
-  if (videoSendQueue.length > 0) {
+  if (getVideoBacklogCount() > 0) {
     scheduleVideoSend();
   }
 }
@@ -779,6 +829,7 @@ function resetPacingStats() {
     minGapMs: Number.POSITIVE_INFINITY,
     gapSumMs: 0,
     gapCount: 0,
+    replacedFrames: 0,
   };
 }
 
@@ -802,9 +853,9 @@ function notePacingSend(byteLength) {
       ? (pacingStats.gapSumMs / pacingStats.gapCount).toFixed(1)
       : "n/a";
     console.log(
-      `[pacing] au/s=${pacingStats.accessUnits} ` +
+      `[pacing] mode=${activeStreamMode} au/s=${pacingStats.accessUnits} ` +
         `kbps=${Math.round((pacingStats.bytes * 8) / 1000)} ` +
-        `queue=${videoSendQueue.length} ` +
+        `queue=${getVideoBacklogCount()} replaced=${pacingStats.replacedFrames} ` +
         `gapMs avg=${avgGapMs} min=${pacingStats.minGapMs === Number.POSITIVE_INFINITY ? "n/a" : pacingStats.minGapMs} ` +
         `max=${pacingStats.maxGapMs}`
     );
@@ -815,6 +866,7 @@ function notePacingSend(byteLength) {
     pacingStats.minGapMs = Number.POSITIVE_INFINITY;
     pacingStats.gapSumMs = 0;
     pacingStats.gapCount = 0;
+    pacingStats.replacedFrames = 0;
   }
 }
 
@@ -862,7 +914,7 @@ function sendVideoConfig() {
   }
   console.log(
     `Sending video_config ${lastVideoConfig.width}x${lastVideoConfig.height} ` +
-      `fps=${lastVideoConfig.fps} encoder=${lastVideoConfig.encoder}`
+      `fps=${lastVideoConfig.fps} encoder=${lastVideoConfig.encoder} mode=${activeStreamMode}`
   );
   broadcastText(JSON.stringify(lastVideoConfig));
   sentVideoConfig = true;
@@ -1142,9 +1194,9 @@ function buildRawFfmpegArgs(encoderName, videoInfo) {
       "-bufsize",
       `${Math.max(1000, Math.round(bitrateKbps / 2))}k`,
       "-g",
-      "60",
+      "30",
       "-keyint_min",
-      "60",
+      "30",
       "-bf",
       "0",
       "-zerolatency",
@@ -1181,9 +1233,9 @@ function buildRawFfmpegArgs(encoderName, videoInfo) {
     "-bufsize",
     `${Math.max(1000, Math.round(bitrateKbps / 2))}k`,
     "-g",
-    "60",
+    "30",
     "-keyint_min",
-    "60",
+    "30",
     "-bf",
     "0",
     "-zerolatency",
@@ -1255,9 +1307,9 @@ function buildDirectFfmpegArgs(probeInfo, videoInfo) {
     "-bufsize",
     `${Math.max(1000, Math.round(bitrateKbps / 2))}k`,
     "-g",
-    "60",
+    "30",
     "-keyint_min",
-    "60",
+    "30",
     "-bf",
     "0",
     "-zerolatency",
@@ -1658,9 +1710,7 @@ function requestInputTaskCount(force = false) {
     return;
   }
   lastTaskCountRequestMs = now;
-  if (inputProcess && !inputProcess.killed) {
-    inputProcess.stdin.write("tc\n");
-  }
+  writeInput("tc\n");
 }
 
 function queryTaskCountPowerShellAsync(onDone = () => {}) {
@@ -1723,8 +1773,17 @@ function sendTaskCountToClient(ws) {
 }
 
 function writeInput(line) {
-  if (inputProcess && !inputProcess.killed) {
+  if (!inputProcess || inputProcess.killed || !inputProcess.stdin || inputProcess.stdin.destroyed || inputProcess.exitCode != null) {
+    return false;
+  }
+  try {
     inputProcess.stdin.write(line);
+    return true;
+  } catch (err) {
+    if (err && err.code !== "EPIPE" && err.code !== "ERR_STREAM_DESTROYED") {
+      console.warn("input write failed:", err.message || err);
+    }
+    return false;
   }
 }
 
@@ -1831,6 +1890,11 @@ function startInputProcess() {
     inputProcess.on("error", (err) => {
       console.error("Failed to start input process:", err);
     });
+    inputProcess.stdin.on("error", (err) => {
+      if (err && err.code !== "EPIPE" && err.code !== "ERR_STREAM_DESTROYED") {
+        console.warn("Input handler stdin error:", err.message || err);
+      }
+    });
     inputProcess.stderr.on("data", handleInputStderr);
     inputProcess.on("exit", (code) => {
       if (!shuttingDown) {
@@ -1925,38 +1989,36 @@ wss.on("connection", (ws) => {
           console.log(`Switched to monitor ${data.value}`);
         }
       } else if (data.type === "mouse_move") {
-        if (inputProcess && !inputProcess.killed) {
-          inputProcess.stdin.write(`mr ${Math.round(data.dx)} ${Math.round(data.dy)}\n`);
-        }
+        writeInput(`mr ${Math.round(data.dx)} ${Math.round(data.dy)}\n`);
       } else if (data.type === "mouse_move_abs") {
-        if (inputProcess && !inputProcess.killed) {
-          const monitor = activeMonitorInfo || { x: 0, y: 0 };
-          const absX = Math.round(data.x) + monitor.x;
-          const absY = Math.round(data.y) + monitor.y;
-          inputProcess.stdin.write(`mm ${absX} ${absY}\n`);
-        }
+        const monitor = activeMonitorInfo || { x: 0, y: 0 };
+        const absX = Math.round(data.x) + monitor.x;
+        const absY = Math.round(data.y) + monitor.y;
+        writeInput(`mm ${absX} ${absY}\n`);
       } else if (data.type === "mouse_down") {
-        inputProcess?.stdin.write(`md ${data.button}\n`);
+        writeInput(`md ${data.button}\n`);
       } else if (data.type === "mouse_up") {
-        inputProcess?.stdin.write(`mu ${data.button}\n`);
+        writeInput(`mu ${data.button}\n`);
       } else if (data.type === "mouse_wheel") {
-        inputProcess?.stdin.write(`mw ${Math.round(data.delta)}\n`);
+        writeInput(`mw ${Math.round(data.delta)}\n`);
       } else if (data.type === "key_down") {
-        if (data.alt) inputProcess?.stdin.write(`kd 18\n`);
-        if (data.shift) inputProcess?.stdin.write(`kd 16\n`);
-        inputProcess?.stdin.write(`kd ${data.vk}\n`);
+        if (data.alt) writeInput(`kd 18\n`);
+        if (data.shift) writeInput(`kd 16\n`);
+        writeInput(`kd ${data.vk}\n`);
       } else if (data.type === "key_up") {
-        inputProcess?.stdin.write(`ku ${data.vk}\n`);
-        if (data.shift) inputProcess?.stdin.write(`ku 16\n`);
-        if (data.alt) inputProcess?.stdin.write(`ku 18\n`);
+        writeInput(`ku ${data.vk}\n`);
+        if (data.shift) writeInput(`ku 16\n`);
+        if (data.alt) writeInput(`ku 18\n`);
       } else if (data.type === "task_switcher") {
         handleTaskSwitcher(data.action, data.steps);
-      } else if (data.type === "request_task_count") {
-        refreshTaskCount();
-        sendTaskCountToClient(ws);
-      } else if (data.type === "ping") {
-        ws.send(JSON.stringify({
-          type: "pong",
+        } else if (data.type === "request_task_count") {
+          refreshTaskCount();
+          sendTaskCountToClient(ws);
+        } else if (data.type === "set_stream_mode") {
+          applyStreamMode(data.value);
+        } else if (data.type === "ping") {
+          ws.send(JSON.stringify({
+            type: "pong",
           id: data.id,
           t: data.t,
           server_now: Date.now(),

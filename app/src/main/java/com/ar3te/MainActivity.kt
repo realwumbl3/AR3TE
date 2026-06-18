@@ -55,6 +55,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -193,6 +194,8 @@ class MainActivity : ComponentActivity() {
                             openTaskCount = openTaskCount,
                             isPointerCaptured = isPointerCaptured,
                             is3DofEnabled = is3DofEnabled,
+                            streamMode = externalDisplayService?.streamMode ?: StreamMode.LOW_LATENCY,
+                            lastInteractiveInputMs = externalDisplayService?.lastInteractiveInputMs ?: 0L,
                             showEmbeddedPreview = externalDisplayService?.hasPresentationDisplay != true,
                             previewCursorX = externalDisplayService?.localCursorX ?: 0f,
                             previewCursorY = externalDisplayService?.localCursorY ?: 0f,
@@ -262,6 +265,9 @@ class MainActivity : ComponentActivity() {
                                 } else {
                                     tracker.stop()
                                 }
+                            },
+                            onStreamModeChange = { mode ->
+                                externalDisplayService?.streamMode = mode
                             },
                             modifier = Modifier.padding(innerPadding).imePadding()
                         )
@@ -480,6 +486,8 @@ fun ScreenSharingScreen(
     openTaskCount: Int,
     isPointerCaptured: Boolean,
     is3DofEnabled: Boolean,
+    streamMode: StreamMode,
+    lastInteractiveInputMs: Long,
     showEmbeddedPreview: Boolean,
     previewCursorX: Float,
     previewCursorY: Float,
@@ -496,6 +504,7 @@ fun ScreenSharingScreen(
     onCapturedMouseEvent: (MotionEvent) -> Boolean,
     onCaptureToggle: (Boolean) -> Unit,
     on3DofToggle: (Boolean) -> Unit,
+    onStreamModeChange: (StreamMode) -> Unit,
     modifier: Modifier = Modifier
 ) {
     var monitorIndex by remember { mutableIntStateOf(1) }
@@ -644,6 +653,35 @@ fun ScreenSharingScreen(
                         )
                         Text(stringResource(R.string.enable_3dof_view))
                     }
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(
+                        text = stringResource(R.string.streaming_mode_title),
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = stringResource(R.string.streaming_mode_summary),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        StreamModeChip(
+                            label = stringResource(R.string.streaming_mode_auto),
+                            selected = streamMode == StreamMode.AUTO,
+                            onClick = { onStreamModeChange(StreamMode.AUTO) }
+                        )
+                        StreamModeChip(
+                            label = stringResource(R.string.streaming_mode_low_latency),
+                            selected = streamMode == StreamMode.LOW_LATENCY,
+                            onClick = { onStreamModeChange(StreamMode.LOW_LATENCY) }
+                        )
+                        StreamModeChip(
+                            label = stringResource(R.string.streaming_mode_smooth_buffered),
+                            selected = streamMode == StreamMode.SMOOTH_BUFFERED,
+                            onClick = { onStreamModeChange(StreamMode.SMOOTH_BUFFERED) }
+                        )
+                    }
                     if (is3DofEnabled) {
                         Spacer(modifier = Modifier.height(8.dp))
                         ThreeDofPhoneStatus()
@@ -758,6 +796,8 @@ fun ScreenSharingScreen(
                     onCaptureMethodUpdated = onPreviewCaptureMethodUpdated,
                     onAudioStateUpdated = onPreviewAudioStateUpdated,
                     onTaskCountUpdated = onPreviewTaskCountUpdated,
+                    streamMode = streamMode,
+                    lastInteractiveInputMs = lastInteractiveInputMs,
                     onClientReady = onPreviewClientReady,
                     onRemoteCursorReceived = onPreviewRemoteCursorReceived,
                     localCursorX = previewCursorX,
@@ -887,6 +927,34 @@ fun ScreenSharingScreen(
         TaskSwitcherSlider(
             taskCount = openTaskCount,
             onSendMessage = onSendMessage
+        )
+    }
+}
+
+@Composable
+private fun StreamModeChip(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    Surface(
+        modifier = Modifier.clickable(onClick = onClick),
+        shape = RoundedCornerShape(999.dp),
+        color = if (selected) {
+            MaterialTheme.colorScheme.primary
+        } else {
+            MaterialTheme.colorScheme.surface
+        },
+        contentColor = if (selected) {
+            MaterialTheme.colorScheme.onPrimary
+        } else {
+            MaterialTheme.colorScheme.onSurface
+        }
+    ) {
+        Text(
+            text = label,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            style = MaterialTheme.typography.labelLarge
         )
     }
 }
