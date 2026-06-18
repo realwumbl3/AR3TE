@@ -991,7 +991,7 @@ private fun FramePacingGraph(
     val latestMs = samples.lastOrNull() ?: baselineMs
     val avgMs = if (samples.isNotEmpty()) samples.average().toFloat() else baselineMs
     val minMs = samples.minOrNull() ?: baselineMs
-    val maxSampleMs = maxOf(samples.maxOrNull() ?: baselineMs, cursorSamples.maxOrNull() ?: baselineMs)
+    val maxSampleMs = samples.maxOrNull() ?: baselineMs
     val maxMs = maxOf(baselineMs * 2f, maxSampleMs)
 
     BoxWithConstraints(modifier = modifier) {

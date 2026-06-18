@@ -837,12 +837,16 @@ fun RemoteScreenView(
                             SurfaceView(context).apply {
                                 keepScreenOn = true
                                 holder.setFixedSize(videoConfig!!.width, videoConfig!!.height)
+                                applySurfaceFrameRateHint(holder.surface, videoConfig!!.fps)
                                 holder.addCallback(decoderController)
+                                decoderController.setDisplayRefreshRate(display?.refreshRate ?: 0f)
                                 decoderController.bindSurface(holder)
                             }
                         },
                         update = { view ->
                             view.holder.setFixedSize(videoConfig!!.width, videoConfig!!.height)
+                            applySurfaceFrameRateHint(view.holder.surface, videoConfig!!.fps)
+                            decoderController.setDisplayRefreshRate(view.display?.refreshRate ?: 0f)
                             decoderController.bindSurface(view.holder)
                         },
                         modifier = videoModifier.align(Alignment.Center)
@@ -1280,6 +1284,24 @@ data class H264StreamConfig(
     val avcc: ByteArray? = null
 )
 
+private fun applySurfaceFrameRateHint(surface: Surface?, fps: Int) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+        return
+    }
+    if (surface == null || !surface.isValid || fps <= 0) {
+        return
+    }
+    try {
+        surface.setFrameRate(
+            fps.toFloat(),
+            Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE
+        )
+    } catch (_: IllegalStateException) {
+        // Surface lifetime can race AndroidView creation/update; the hint is optional.
+    } catch (_: Exception) {
+    }
+}
+
 class H264StreamController(
     private val scope: kotlinx.coroutines.CoroutineScope
 ) : SurfaceHolder.Callback {
@@ -1298,11 +1320,14 @@ class H264StreamController(
     private var inputJob: Job? = null
     private var nextPtsUs = 0L
     private var frameDurationUs = 16_666L
+    private var displayFrameDurationNs = 16_666_667L
     @Volatile
     private var frameCallbackPosted = false
     @Volatile
     private var waitingForKeyframe = true
     private var smoothBufferedPrimed = false
+    private var nextBufferedPresentTimeNs = 0L
+    private var smoothBufferedEmptyVsyncs = 0
     private var renderCount = 0
     private var renderStatsLastMs = 0L
     private var renderGapSumMs = 0.0
@@ -1329,6 +1354,13 @@ class H264StreamController(
             stopCodec()
         }
         maybeStartCodec()
+    }
+
+    fun setDisplayRefreshRate(refreshRateHz: Float) {
+        if (!refreshRateHz.isFinite() || refreshRateHz <= 0f) {
+            return
+        }
+        displayFrameDurationNs = (1_000_000_000.0 / refreshRateHz.toDouble()).toLong().coerceAtLeast(1L)
     }
 
     fun queueFrame(frame: ByteArray, captureMs: Long? = null) {
@@ -1426,6 +1458,7 @@ class H264StreamController(
                 codec = decoder
                 nextPtsUs = 0L
                 smoothBufferedPrimed = false
+                nextBufferedPresentTimeNs = 0L
                 resetRenderStats()
             }
             clearReadyOutputs(null)
@@ -1556,23 +1589,8 @@ class H264StreamController(
             return@FrameCallback
         }
 
-        val outputs = synchronized(outputLock) {
-            if (streamMode != StreamMode.LOW_LATENCY) {
-                if (!smoothBufferedPrimed) {
-                    if (readyOutputs.size < SMOOTH_BUFFERED_PREROLL_FRAMES) {
-                        emptyList()
-                    } else {
-                        smoothBufferedPrimed = true
-                        buildList<ReadyOutput> {
-                            readyOutputs.pollFirst()?.let { add(it) }
-                        }
-                    }
-                } else {
-                    buildList<ReadyOutput> {
-                        readyOutputs.pollFirst()?.let { add(it) }
-                    }
-                }
-            } else {
+        if (streamMode == StreamMode.LOW_LATENCY) {
+            val outputs = synchronized(outputLock) {
                 buildList<ReadyOutput> {
                     while (readyOutputs.size > 1) {
                         readyOutputs.pollFirst()?.let { stale ->
@@ -1585,23 +1603,74 @@ class H264StreamController(
                     readyOutputs.pollFirst()?.let { add(it) }
                 }
             }
+            outputs.forEachIndexed { index, ready ->
+                noteRender(ready.captureMs, frameTimeNanos)
+                val presentTimeNs = if (index == 0 && outputs.size == 1) {
+                    frameTimeNanos
+                } else {
+                    System.nanoTime()
+                }
+                decoder.releaseOutputBuffer(ready.bufferIndex, presentTimeNs)
+            }
+            synchronized(outputLock) {
+                if (readyOutputs.isNotEmpty()) {
+                    requestVsyncRelease()
+                }
+            }
+            return@FrameCallback
         }
 
-        outputs.forEachIndexed { index, ready ->
-            noteRender(ready.captureMs)
-            val presentTimeNs = if (index == 0 && outputs.size == 1) {
-                frameTimeNanos
-            } else {
-                System.nanoTime()
+        val ready = synchronized(outputLock) {
+            when {
+                !smoothBufferedPrimed && readyOutputs.size >= SMOOTH_BUFFERED_PREROLL_FRAMES -> {
+                    smoothBufferedPrimed = true
+                    smoothBufferedEmptyVsyncs = 0
+                    readyOutputs.pollFirst()
+                }
+                smoothBufferedPrimed -> readyOutputs.pollFirst()
+                else -> null
             }
-            decoder.releaseOutputBuffer(ready.bufferIndex, presentTimeNs)
         }
+
+        if (ready == null) {
+            val keepRunning = synchronized(outputLock) {
+                if (!smoothBufferedPrimed) {
+                    readyOutputs.isNotEmpty()
+                } else {
+                    smoothBufferedEmptyVsyncs += 1
+                    if (nextBufferedPresentTimeNs != 0L) {
+                        nextBufferedPresentTimeNs += displayFrameDurationNs
+                    }
+                    if (smoothBufferedEmptyVsyncs >= SMOOTH_BUFFERED_MAX_EMPTY_VSYNCS) {
+                        smoothBufferedPrimed = false
+                        smoothBufferedEmptyVsyncs = 0
+                        nextBufferedPresentTimeNs = 0L
+                        false
+                    } else {
+                        true
+                    }
+                }
+            }
+            if (keepRunning) {
+                requestVsyncRelease()
+            }
+            return@FrameCallback
+        }
+
+        smoothBufferedEmptyVsyncs = 0
+        noteRender(ready.captureMs, frameTimeNanos)
+        val frameDurationNs = displayFrameDurationNs
+        val targetPresentTimeNs = when {
+            nextBufferedPresentTimeNs == 0L -> frameTimeNanos
+            frameTimeNanos > nextBufferedPresentTimeNs + BUFFERED_PRESENT_DRIFT_TOLERANCE_NS -> frameTimeNanos
+            else -> nextBufferedPresentTimeNs
+        }
+        val scheduledPresentTimeNs = maxOf(frameTimeNanos, targetPresentTimeNs)
+        nextBufferedPresentTimeNs = scheduledPresentTimeNs + frameDurationNs
+        decoder.releaseOutputBuffer(ready.bufferIndex, scheduledPresentTimeNs)
 
         synchronized(outputLock) {
-            if (streamMode != StreamMode.LOW_LATENCY && readyOutputs.isEmpty()) {
-                smoothBufferedPrimed = false
-            }
-            if (readyOutputs.isNotEmpty()) {
+            if (smoothBufferedPrimed || readyOutputs.isNotEmpty()) {
                 requestVsyncRelease()
             }
         }
@@ -1653,12 +1722,12 @@ class H264StreamController(
         return rendered
     }
 
-    private fun noteRender(captureMs: Long?) {
+    private fun noteRender(captureMs: Long?, renderTimeNs: Long = System.nanoTime()) {
         captureMs?.let {
             val sample = (System.currentTimeMillis() + clockOffsetMs() - it).toDouble().coerceAtLeast(0.0)
             onLatencySample?.invoke(sample)
         }
-        val nowMs = System.currentTimeMillis()
+        val nowMs = renderTimeNs / 1_000_000L
         if (lastRenderMs > 0L) {
             val gapMs = (nowMs - lastRenderMs).toDouble()
             onFrameGapSample?.invoke(gapMs)
@@ -1713,6 +1782,8 @@ class H264StreamController(
             nextPtsUs = 0L
             waitingForKeyframe = true
             smoothBufferedPrimed = false
+            smoothBufferedEmptyVsyncs = 0
+            nextBufferedPresentTimeNs = 0L
             resetRenderStats()
             current
         }
@@ -1764,8 +1835,10 @@ class H264StreamController(
 
     companion object {
         private const val MAX_READY_FRAMES_LOW_LATENCY = 2
-        private const val MAX_READY_FRAMES_SMOOTH_BUFFERED = 4
-        private const val SMOOTH_BUFFERED_PREROLL_FRAMES = 2
+        private const val MAX_READY_FRAMES_SMOOTH_BUFFERED = 8
+        private const val SMOOTH_BUFFERED_PREROLL_FRAMES = 4
+        private const val SMOOTH_BUFFERED_MAX_EMPTY_VSYNCS = 3
+        private const val BUFFERED_PRESENT_DRIFT_TOLERANCE_NS = 3_000_000L
     }
 }
 

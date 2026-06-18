@@ -415,6 +415,7 @@ let cursorWss = null;
 let activeStreamMode = STREAM_MODE_LOW_LATENCY;
 const DEBUG_PACING = process.env.AR3TE_DEBUG_PACING !== "0";
 const TARGET_FRAME_INTERVAL_MS = 1000 / 60;
+const SMOOTH_BUFFERED_MAX_QUEUE_FRAMES = 4;
 let videoSendQueue = [];
 let videoSendTimer = null;
 let lastVideoSendMs = 0;
@@ -432,7 +433,7 @@ let pacingStats = {
 };
 
 function getVideoBacklogCount() {
-  return activeStreamMode === STREAM_MODE_LOW_LATENCY ? 0 : videoSendQueue.length;
+  return activeStreamMode === STREAM_MODE_SMOOTH_BUFFERED ? videoSendQueue.length : 0;
 }
 
 function resendCurrentVideoState(ws = null) {
@@ -796,10 +797,15 @@ function resetVideoSendPacer() {
 }
 
 function enqueueVideoFrame(frame, capturedAtMs = Date.now()) {
-  if (activeStreamMode === STREAM_MODE_LOW_LATENCY || activeStreamMode === STREAM_MODE_SMOOTH_BUFFERED) {
+  if (activeStreamMode === STREAM_MODE_LOW_LATENCY) {
     lastVideoSendMs = Date.now();
     sendBinaryImmediate(frame, capturedAtMs);
     return;
+  }
+
+  while (videoSendQueue.length >= SMOOTH_BUFFERED_MAX_QUEUE_FRAMES) {
+    videoSendQueue.shift();
+    pacingStats.replacedFrames += 1;
   }
   videoSendQueue.push({ frame, capturedAtMs });
   if (videoSendTimer) {
@@ -1370,10 +1376,6 @@ function buildDirectFfmpegArgs(probeInfo, videoInfo) {
     "0",
     "-aud",
     "1",
-    "-r",
-    "60",
-    "-vsync",
-    "cfr",
     "-bsf:v",
     "dump_extra,h264_metadata=aud=insert",
     "-f",
