@@ -26,6 +26,7 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.input.pointer.changedToUp
@@ -43,6 +44,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
@@ -191,6 +193,7 @@ class MainActivity : ComponentActivity() {
                             currentLatencyMs = externalDisplayService?.currentLatencyMs ?: -1,
                             currentCaptureMethod = externalDisplayService?.currentCaptureMethod ?: stringResource(R.string.loading),
                             currentAudioState = externalDisplayService?.currentAudioState ?: stringResource(R.string.loading),
+                            framePacingSamples = externalDisplayService?.framePacingSamples ?: emptyList(),
                             openTaskCount = openTaskCount,
                             isPointerCaptured = isPointerCaptured,
                             is3DofEnabled = is3DofEnabled,
@@ -234,6 +237,9 @@ class MainActivity : ComponentActivity() {
                             },
                             onPreviewAudioStateUpdated = { state ->
                                 externalDisplayService?.updateAudioState(state)
+                            },
+                            onPreviewFramePacingUpdated = { samples ->
+                                externalDisplayService?.updateFramePacing(samples)
                             },
                             onPreviewTaskCountUpdated = { count ->
                                 externalDisplayService?.updateTaskCount(count)
@@ -483,6 +489,7 @@ fun ScreenSharingScreen(
     currentLatencyMs: Int,
     currentCaptureMethod: String,
     currentAudioState: String,
+    framePacingSamples: List<Float>,
     openTaskCount: Int,
     isPointerCaptured: Boolean,
     is3DofEnabled: Boolean,
@@ -499,6 +506,7 @@ fun ScreenSharingScreen(
     onPreviewStatsUpdated: (Int, Double, String?, Int) -> Unit,
     onPreviewCaptureMethodUpdated: (String) -> Unit,
     onPreviewAudioStateUpdated: (String) -> Unit,
+    onPreviewFramePacingUpdated: (List<Float>) -> Unit,
     onPreviewTaskCountUpdated: (Int) -> Unit,
     onPreviewRemoteCursorReceived: (Float, Float, Int, Int) -> Unit,
     onCapturedMouseEvent: (MotionEvent) -> Boolean,
@@ -509,6 +517,7 @@ fun ScreenSharingScreen(
 ) {
     var monitorIndex by remember { mutableIntStateOf(1) }
     var showDebugMenu by remember { mutableStateOf(false) }
+    var showFramePacingGraph by remember { mutableStateOf(false) }
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusRequester = remember { FocusRequester() }
     var keyboardText by remember { mutableStateOf(TextFieldValue(" ", selection = TextRange(1))) }
@@ -653,6 +662,13 @@ fun ScreenSharingScreen(
                         )
                         Text(stringResource(R.string.enable_3dof_view))
                     }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(
+                            checked = showFramePacingGraph,
+                            onCheckedChange = { showFramePacingGraph = it }
+                        )
+                        Text(stringResource(R.string.show_frame_pacing_graph))
+                    }
                     Spacer(modifier = Modifier.height(12.dp))
                     Text(
                         text = stringResource(R.string.streaming_mode_title),
@@ -795,6 +811,7 @@ fun ScreenSharingScreen(
                     onStatsUpdated = onPreviewStatsUpdated,
                     onCaptureMethodUpdated = onPreviewCaptureMethodUpdated,
                     onAudioStateUpdated = onPreviewAudioStateUpdated,
+                    onFramePacingUpdated = onPreviewFramePacingUpdated,
                     onTaskCountUpdated = onPreviewTaskCountUpdated,
                     streamMode = streamMode,
                     lastInteractiveInputMs = lastInteractiveInputMs,
@@ -914,6 +931,12 @@ fun ScreenSharingScreen(
                 modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center
             ) {
+                if (showFramePacingGraph) {
+                    FramePacingGraph(
+                        samples = framePacingSamples,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
                 Text(
                     text = if (isPointerCaptured) stringResource(R.string.trackpad_captured) else stringResource(R.string.trackpad_idle),
                     color = Color.DarkGray,
@@ -928,6 +951,155 @@ fun ScreenSharingScreen(
             taskCount = openTaskCount,
             onSendMessage = onSendMessage
         )
+    }
+}
+
+@Composable
+private fun FramePacingGraph(
+    samples: List<Float>,
+    modifier: Modifier = Modifier
+) {
+    val graphColor = Color.LightGray.copy(alpha = 0.95f)
+    val guideColor = Color.Gray.copy(alpha = 0.45f)
+    val targetColor = Color(0xFFBDBDBD).copy(alpha = 0.95f)
+    val latestColor = Color.White.copy(alpha = 0.95f)
+    val labelColor = Color.LightGray.copy(alpha = 0.9f)
+    val startIndex = 0
+    val middleIndex = if (samples.isEmpty()) 0 else (samples.lastIndex / 2)
+    val endIndex = samples.lastIndex.coerceAtLeast(0)
+    val baselineMs = 16.67f
+    val latestMs = samples.lastOrNull() ?: baselineMs
+    val avgMs = if (samples.isNotEmpty()) samples.average().toFloat() else baselineMs
+    val minMs = samples.minOrNull() ?: baselineMs
+    val maxSampleMs = samples.maxOrNull() ?: baselineMs
+    val maxMs = maxOf(baselineMs * 2f, maxSampleMs)
+
+    BoxWithConstraints(modifier = modifier) {
+        val graphHeight = maxHeight / 3
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(graphHeight)
+                .padding(horizontal = 8.dp, vertical = 6.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = stringResource(R.string.frame_pacing_stats, latestMs, avgMs, minMs, maxSampleMs),
+                    color = labelColor,
+                    style = MaterialTheme.typography.labelSmall
+                )
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            Box(modifier = Modifier.weight(1f)) {
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                val graphTop = size.height * 0.1f
+                val graphBottom = size.height * 0.82f
+                val graphBodyHeight = (graphBottom - graphTop).coerceAtLeast(1f)
+                fun toY(sample: Float): Float {
+                    val normalized = sample.coerceIn(0f, maxMs) / maxMs
+                    return graphBottom - (normalized * graphBodyHeight)
+                }
+
+                drawRect(
+                    color = guideColor.copy(alpha = 0.16f),
+                    topLeft = Offset.Zero,
+                    size = size
+                )
+                drawLine(
+                    color = guideColor,
+                    start = Offset(0f, graphTop),
+                    end = Offset(size.width, graphTop),
+                    strokeWidth = 1.dp.toPx()
+                )
+                drawLine(
+                    color = guideColor,
+                    start = Offset(0f, graphBottom),
+                    end = Offset(size.width, graphBottom),
+                    strokeWidth = 1.dp.toPx()
+                )
+                val baselineY = toY(baselineMs)
+                drawLine(
+                    color = targetColor,
+                    start = Offset(0f, baselineY),
+                    end = Offset(size.width, baselineY),
+                    strokeWidth = 1.5.dp.toPx()
+                )
+                if (samples.size < 2) {
+                    return@Canvas
+                }
+                val stepX = size.width / (samples.size - 1).coerceAtLeast(1)
+                var previous = Offset(x = 0f, y = toY(samples.first()))
+                for (i in 1 until samples.size) {
+                    val current = Offset(
+                        x = stepX * i,
+                        y = toY(samples[i])
+                    )
+                    drawLine(
+                        color = graphColor,
+                        start = previous,
+                        end = current,
+                        strokeWidth = 2.5.dp.toPx()
+                    )
+                    previous = current
+                }
+                drawCircle(
+                    color = latestColor,
+                    radius = 3.dp.toPx(),
+                    center = previous
+                )
+            }
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(start = 4.dp, top = 2.dp)
+                ) {
+                    Text(
+                        text = stringResource(R.string.frame_pacing_y_label, maxMs),
+                        color = labelColor,
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                    Spacer(modifier = Modifier.weight(1f))
+                    Text(
+                        text = stringResource(R.string.frame_pacing_y_label, baselineMs),
+                        color = labelColor,
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                    Spacer(modifier = Modifier.weight(1f))
+                    Text(
+                        text = stringResource(R.string.frame_pacing_y_label, 0f),
+                        color = labelColor,
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                }
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .padding(horizontal = 4.dp)
+                        .wrapContentHeight(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = startIndex.toString(),
+                        color = labelColor,
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                    Text(
+                        text = middleIndex.toString(),
+                        color = labelColor,
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                    Text(
+                        text = endIndex.toString(),
+                        color = labelColor,
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                }
+            }
+        }
     }
 }
 

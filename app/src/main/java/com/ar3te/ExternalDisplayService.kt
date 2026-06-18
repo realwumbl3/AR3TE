@@ -118,6 +118,13 @@ class ExternalDisplayService : LifecycleService() {
             _currentAudioState = value
         }
 
+    private var _framePacingSamples by mutableStateOf<List<Float>>(emptyList())
+    var framePacingSamples: List<Float>
+        get() = _framePacingSamples
+        private set(value) {
+            _framePacingSamples = value
+        }
+
     private var _openTaskCount by mutableIntStateOf(0)
     var openTaskCount: Int
         get() = _openTaskCount
@@ -206,6 +213,10 @@ class ExternalDisplayService : LifecycleService() {
         currentAudioState = state
     }
 
+    fun updateFramePacing(samples: List<Float>) {
+        framePacingSamples = samples
+    }
+
     fun updateTaskCount(count: Int) {
         openTaskCount = count
         taskCountListener?.invoke(count)
@@ -268,6 +279,9 @@ class ExternalDisplayService : LifecycleService() {
                     }
                     onAudioStateUpdated = { state ->
                         updateAudioState(state)
+                    }
+                    onFramePacingUpdated = { samples ->
+                        updateFramePacing(samples)
                     }
                     onTaskCountUpdated = { count ->
                         updateTaskCount(count)

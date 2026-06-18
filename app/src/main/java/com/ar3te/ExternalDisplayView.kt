@@ -81,6 +81,7 @@ import java.nio.ByteBuffer
 import java.util.ArrayDeque
 import java.util.Locale
 import kotlin.math.roundToInt
+import kotlin.math.max
 import org.json.JSONArray
 import org.json.JSONObject
 import androidx.lifecycle.LifecycleOwner
@@ -115,6 +116,7 @@ private const val VIDEO_TIMESTAMP_BYTES = 8
 private const val VIDEO_HEADER_BYTES = 1 + VIDEO_TIMESTAMP_BYTES
 private const val ENABLE_DEBUG_LOGS = false
 private const val AUTO_MODE_COOLDOWN_MS = 3_000L
+private const val FRAME_PACING_SAMPLE_COUNT = 120
 
 private fun debugLog(tag: String, message: String) {
     if (!ENABLE_DEBUG_LOGS) {
@@ -206,6 +208,7 @@ class ExternalDisplayPresentation(
     var onStatsUpdated: ((Int, Double, String?, Int) -> Unit)? = null
     var onCaptureMethodUpdated: ((String) -> Unit)? = null
     var onAudioStateUpdated: ((String) -> Unit)? = null
+    var onFramePacingUpdated: ((List<Float>) -> Unit)? = null
     var onTaskCountUpdated: ((Int) -> Unit)? = null
     var onSendMessage: ((String) -> Unit)? = null
     var onRemoteCursorReceived: ((Float, Float, Int, Int) -> Unit)? = null
@@ -240,6 +243,7 @@ class ExternalDisplayPresentation(
                     onStatsUpdated, 
                     onCaptureMethodUpdated, 
                     onAudioStateUpdated,
+                    onFramePacingUpdated,
                     onTaskCountUpdated,
                     { onSendMessage = it },
                     { x, y, w, h -> onRemoteCursorReceived?.invoke(x, y, w, h) },
@@ -274,6 +278,7 @@ fun ExternalDisplayScreen(
     onStatsUpdated: ((Int, Double, String?, Int) -> Unit)? = null,
     onCaptureMethodUpdated: ((String) -> Unit)? = null,
     onAudioStateUpdated: ((String) -> Unit)? = null,
+    onFramePacingUpdated: ((List<Float>) -> Unit)? = null,
     onTaskCountUpdated: ((Int) -> Unit)? = null,
     onClientReady: ((String) -> Unit) -> Unit = {},
     onRemoteCursorReceived: (Float, Float, Int, Int) -> Unit = { _, _, _, _ -> },
@@ -292,6 +297,7 @@ fun ExternalDisplayScreen(
                 onStatsUpdated, 
                 onCaptureMethodUpdated, 
                 onAudioStateUpdated,
+                onFramePacingUpdated,
                 onTaskCountUpdated,
                 onClientReady, 
                 onRemoteCursorReceived,
@@ -336,6 +342,7 @@ fun RemoteScreenView(
     onStatsUpdated: ((Int, Double, String?, Int) -> Unit)? = null,
     onCaptureMethodUpdated: ((String) -> Unit)? = null,
     onAudioStateUpdated: ((String) -> Unit)? = null,
+    onFramePacingUpdated: ((List<Float>) -> Unit)? = null,
     onTaskCountUpdated: ((Int) -> Unit)? = null,
     onClientReady: ((String) -> Unit) -> Unit = {},
     onRemoteCursorReceived: (Float, Float, Int, Int) -> Unit = { _, _, _, _ -> },
@@ -471,6 +478,19 @@ fun RemoteScreenView(
             decoderController.onCatchUp = {
                 hasLatency = false
                 latencyEma = 0.0
+            }
+            val pacingSamples = ArrayDeque<Float>()
+            decoderController.onFrameGapSample = { gapMs ->
+                val snapshot = synchronized(pacingSamples) {
+                    pacingSamples.addLast(gapMs.toFloat())
+                    while (pacingSamples.size > FRAME_PACING_SAMPLE_COUNT) {
+                        pacingSamples.removeFirst()
+                    }
+                    pacingSamples.toList()
+                }
+                scope.launch(Dispatchers.Main) {
+                    onFramePacingUpdated?.invoke(snapshot)
+                }
             }
 
             val uri = URI("ws://${machine.host}:${machine.wsPort}")
@@ -1198,6 +1218,7 @@ class H264StreamController(
     private var frameCallbackPosted = false
     @Volatile
     private var waitingForKeyframe = true
+    private var smoothBufferedPrimed = false
     private var renderCount = 0
     private var renderStatsLastMs = 0L
     private var renderGapSumMs = 0.0
@@ -1208,6 +1229,7 @@ class H264StreamController(
     var clockOffsetMs: () -> Long = { 0L }
     var onLatencySample: ((Double) -> Unit)? = null
     var onCatchUp: (() -> Unit)? = null
+    var onFrameGapSample: ((Double) -> Unit)? = null
     @Volatile
     var streamMode: StreamMode = StreamMode.LOW_LATENCY
 
@@ -1319,6 +1341,7 @@ class H264StreamController(
             synchronized(codecLock) {
                 codec = decoder
                 nextPtsUs = 0L
+                smoothBufferedPrimed = false
                 resetRenderStats()
             }
             clearReadyOutputs(null)
@@ -1450,8 +1473,23 @@ class H264StreamController(
         }
 
         val outputs = synchronized(outputLock) {
-            buildList<ReadyOutput> {
-                if (streamMode == StreamMode.LOW_LATENCY && readyOutputs.isNotEmpty()) {
+            if (streamMode != StreamMode.LOW_LATENCY) {
+                if (!smoothBufferedPrimed) {
+                    if (readyOutputs.size < SMOOTH_BUFFERED_PREROLL_FRAMES) {
+                        emptyList()
+                    } else {
+                        smoothBufferedPrimed = true
+                        buildList<ReadyOutput> {
+                            readyOutputs.pollFirst()?.let { add(it) }
+                        }
+                    }
+                } else {
+                    buildList<ReadyOutput> {
+                        readyOutputs.pollFirst()?.let { add(it) }
+                    }
+                }
+            } else {
+                buildList<ReadyOutput> {
                     while (readyOutputs.size > 1) {
                         readyOutputs.pollFirst()?.let { stale ->
                             try {
@@ -1460,8 +1498,6 @@ class H264StreamController(
                             }
                         }
                     }
-                    readyOutputs.pollFirst()?.let { add(it) }
-                } else {
                     readyOutputs.pollFirst()?.let { add(it) }
                 }
             }
@@ -1478,6 +1514,9 @@ class H264StreamController(
         }
 
         synchronized(outputLock) {
+            if (streamMode != StreamMode.LOW_LATENCY && readyOutputs.isEmpty()) {
+                smoothBufferedPrimed = false
+            }
             if (readyOutputs.isNotEmpty()) {
                 requestVsyncRelease()
             }
@@ -1535,10 +1574,15 @@ class H264StreamController(
             val sample = (System.currentTimeMillis() + clockOffsetMs() - it).toDouble().coerceAtLeast(0.0)
             onLatencySample?.invoke(sample)
         }
+        val nowMs = System.currentTimeMillis()
+        if (lastRenderMs > 0L) {
+            val gapMs = (nowMs - lastRenderMs).toDouble()
+            onFrameGapSample?.invoke(gapMs)
+        }
         if (!ENABLE_DEBUG_LOGS) {
+            lastRenderMs = nowMs
             return
         }
-        val nowMs = System.currentTimeMillis()
         if (lastRenderMs > 0L) {
             val gapMs = (nowMs - lastRenderMs).toDouble()
             renderGapSumMs += gapMs
@@ -1584,6 +1628,7 @@ class H264StreamController(
             inflightCaptureTimes.clear()
             nextPtsUs = 0L
             waitingForKeyframe = true
+            smoothBufferedPrimed = false
             resetRenderStats()
             current
         }
@@ -1636,6 +1681,7 @@ class H264StreamController(
     companion object {
         private const val MAX_READY_FRAMES_LOW_LATENCY = 2
         private const val MAX_READY_FRAMES_SMOOTH_BUFFERED = 4
+        private const val SMOOTH_BUFFERED_PREROLL_FRAMES = 2
     }
 }
 

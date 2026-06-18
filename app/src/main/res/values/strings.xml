@@ -11,6 +11,9 @@
     <string name="debug">Debug</string>
     <string name="debug_menu_title">Debug Menu</string>
     <string name="enable_3dof_view">Enable 3DOF View (Rayneo Air 3S Pro)</string>
+    <string name="show_frame_pacing_graph">Show frame pacing graph</string>
+    <string name="frame_pacing_stats">Latest %1$.1f ms | Avg %2$.1f | Min %3$.1f | Max %4$.1f</string>
+    <string name="frame_pacing_y_label">%.1f ms</string>
     <string name="streaming_mode_title">Streaming Mode</string>
     <string name="streaming_mode_summary">Low latency is the default and keeps interaction responsive by dropping stale frames when needed.</string>
     <string name="streaming_mode_auto">Auto</string>
